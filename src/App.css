@@ -301,6 +301,10 @@ button.primary:hover:not(:disabled) {
   padding: 10px 16px;
 }
 
+.hint-error {
+  color: #f85149;
+}
+
 /* ---------- Log ---------- */
 
 .log {

@@ -111,13 +111,20 @@ body,
 }
 
 .repo-row.active {
-  background: #1f6feb;
-  border-left-color: #58a6ff;
+  background: #212429;
+  border-left-color: #1f6feb;
 }
 
 .repo-row.active .repo-row-name {
   color: white;
   font-weight: 600;
+}
+
+/* The checkbox inside the active row keeps its own accent, but the
+   status dots need a subtle ring to stay readable on the slightly
+   lighter active background. */
+.repo-row.active .dot {
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
 .repo-row-name {

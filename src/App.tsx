@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -30,6 +30,8 @@ const STATE_DOT: Record<RepoState, string> = {
 
 const ACTIONABLE: RepoState[] = ["non-clone", "en-retard"];
 
+const LOG_MAX_ENTRIES = 200;
+
 function actionLabel(state: RepoState): string {
   switch (state) {
     case "non-clone":
@@ -53,6 +55,14 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
+  // Synchronous guard: `busy` (React state) only reflects on the next
+  // render, so a double-click before that re-render would start a
+  // second concurrent clone/pull loop. This ref flips in the same tick.
+  const busyRef = useRef(false);
+
+  const appendLog = useCallback((entry: string) => {
+    setLog((l) => [entry, ...l.slice(0, LOG_MAX_ENTRIES - 1)]);
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -61,11 +71,11 @@ function App() {
       result.sort((a, b) => a.name.localeCompare(b.name));
       setRepos(result);
     } catch (e) {
-      setLog((l) => [`Erreur de chargement : ${String(e)}`, ...l]);
+      appendLog(`Erreur de chargement : ${String(e)}`);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [appendLog]);
 
   useEffect(() => {
     refresh();
@@ -94,7 +104,8 @@ function App() {
   };
 
   const runOn = async (targets: RepoStatus[]) => {
-    if (targets.length === 0 || busy) return;
+    if (targets.length === 0 || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     for (const repo of targets) {
       try {
@@ -102,38 +113,51 @@ function App() {
           repo.state === "non-clone"
             ? await invoke<string>("clone_repo", { name: repo.name })
             : await invoke<string>("pull_repo", { name: repo.name });
-        setLog((l) => [`${repo.name} -- ${msg}`, ...l]);
+        appendLog(`${repo.name} -- ${msg}`);
       } catch (e) {
-        setLog((l) => [`${repo.name} -- echec : ${String(e)}`, ...l]);
+        appendLog(`${repo.name} -- echec : ${String(e)}`);
       }
     }
+    busyRef.current = false;
     setBusy(false);
     setSelected(new Set());
     await refresh();
   };
 
   const updatePackages = async (repo: RepoStatus) => {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       const msg = await invoke<string>("update_packages", { name: repo.name });
-      setLog((l) => [`${repo.name} -- ${msg}`, ...l]);
+      appendLog(`${repo.name} -- ${msg}`);
     } catch (e) {
-      setLog((l) => [`${repo.name} -- echec packages : ${String(e)}`, ...l]);
+      appendLog(`${repo.name} -- echec packages : ${String(e)}`);
     }
+    busyRef.current = false;
     setBusy(false);
   };
 
   const updateFramework = async (repo: RepoStatus) => {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       const msg = await invoke<string>("update_framework", { name: repo.name });
-      setLog((l) => [`${repo.name} -- ${msg}`, ...l]);
+      appendLog(`${repo.name} -- ${msg}`);
     } catch (e) {
-      setLog((l) => [`${repo.name} -- echec Vite/Tauri : ${String(e)}`, ...l]);
+      appendLog(`${repo.name} -- echec Vite/Tauri : ${String(e)}`);
     }
+    busyRef.current = false;
     setBusy(false);
+  };
+
+  const openInExplorer = async (repo: RepoStatus) => {
+    try {
+      await invoke("open_in_explorer", { path: repo.path });
+    } catch (e) {
+      appendLog(`${repo.name} -- ouverture du dossier impossible : ${String(e)}`);
+    }
   };
 
   const selectedActionable = repos.filter(
@@ -246,7 +270,7 @@ function App() {
                 </button>
               )}
               {activeRepo.state !== "non-clone" && (
-                <button onClick={() => invoke("open_in_explorer", { path: activeRepo.path })}>
+                <button onClick={() => openInExplorer(activeRepo)}>
                   Ouvrir le dossier
                 </button>
               )}

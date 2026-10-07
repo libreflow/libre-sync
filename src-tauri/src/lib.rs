@@ -8,6 +8,7 @@ pub fn run() {
             repos::list_repo_status,
             repos::clone_repo,
             repos::pull_repo,
+            repos::stash_pull_repo,
             repos::update_packages,
             repos::update_framework,
             repos::open_in_explorer,

@@ -48,6 +48,7 @@ function App() {
   const [activeName, setActiveName] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   // Synchronous guard: `busy` (React state) only reflects on the next
@@ -56,16 +57,19 @@ function App() {
   const busyRef = useRef(false);
 
   const appendLog = useCallback((entry: string) => {
-    setLog((l) => [entry, ...l.slice(0, LOG_MAX_ENTRIES - 1)]);
+    const time = new Date().toLocaleTimeString();
+    setLog((l) => [`${time} -- ${entry}`, ...l.slice(0, LOG_MAX_ENTRIES - 1)]);
   }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const result = await invoke<RepoStatus[]>("list_repo_status");
       result.sort((a, b) => a.name.localeCompare(b.name));
       setRepos(result);
     } catch (e) {
+      setLoadError(String(e));
       appendLog(`Erreur de chargement : ${String(e)}`);
     } finally {
       setLoading(false);
@@ -82,8 +86,12 @@ function App() {
   );
 
   const actionableRepos = repos.filter((r) => ACTIONABLE.includes(r.state));
+  // Select-all operates on what the filter actually shows: selecting
+  // rows the user cannot see (count larger than the visible list) is
+  // more confusing than helpful.
+  const visibleActionable = filteredRepos.filter((r) => ACTIONABLE.includes(r.state));
   const allActionableSelected =
-    actionableRepos.length > 0 && actionableRepos.every((r) => selected.has(r.name));
+    visibleActionable.length > 0 && visibleActionable.every((r) => selected.has(r.name));
 
   const toggle = (name: string) => {
     setSelected((prev) => {
@@ -95,7 +103,9 @@ function App() {
   };
 
   const toggleAll = () => {
-    setSelected(allActionableSelected ? new Set() : new Set(actionableRepos.map((r) => r.name)));
+    setSelected(
+      allActionableSelected ? new Set() : new Set(visibleActionable.map((r) => r.name)),
+    );
   };
 
   const runOn = async (targets: RepoStatus[]) => {
@@ -104,10 +114,15 @@ function App() {
     setBusy(true);
     for (const repo of targets) {
       try {
+        // A dirty tree would make pull_repo fail with the dirty-tree
+        // guard; behind+dirty repos go straight to the stash-based
+        // update so the batch doesn't stall on them one by one.
         const msg =
           repo.state === "non-clone"
             ? await invoke<string>("clone_repo", { name: repo.name })
-            : await invoke<string>("pull_repo", { name: repo.name });
+            : repo.dirty
+              ? await invoke<string>("stash_pull_repo", { name: repo.name })
+              : await invoke<string>("pull_repo", { name: repo.name });
         appendLog(`${repo.name} -- ${msg}`);
       } catch (e) {
         appendLog(`${repo.name} -- echec : ${String(e)}`);
@@ -131,6 +146,9 @@ function App() {
     }
     busyRef.current = false;
     setBusy(false);
+    // These updates leave uncommitted lockfile changes: refresh so the
+    // dirty flag (and the stash-based button) reflects reality.
+    await refresh();
   };
 
   const updateFramework = async (repo: RepoStatus) => {
@@ -145,6 +163,7 @@ function App() {
     }
     busyRef.current = false;
     setBusy(false);
+    await refresh();
   };
 
   const stashPull = async (repo: RepoStatus) => {
@@ -221,17 +240,24 @@ function App() {
             type="checkbox"
             checked={allActionableSelected}
             onChange={toggleAll}
-            disabled={loading || busy || actionableRepos.length === 0}
+            disabled={loading || busy || visibleActionable.length === 0}
           />
           Tout selectionner
-          {actionableRepos.length > 0 && (
-            <span className="select-all-count">({actionableRepos.length})</span>
+          {visibleActionable.length > 0 && (
+            <span className="select-all-count">({visibleActionable.length})</span>
           )}
         </label>
 
         <div className="repo-list">
           {loading && <p className="hint">Verification...</p>}
-          {!loading && filteredRepos.length === 0 && <p className="hint">Aucun depot.</p>}
+          {!loading && loadError && (
+            <p className="hint hint-error">Erreur de chargement : {loadError}</p>
+          )}
+          {!loading && !loadError && filteredRepos.length === 0 && (
+            <p className="hint">
+              {filter ? `Aucun depot ne correspond a "${filter}".` : "Aucun depot."}
+            </p>
+          )}
           {!loading &&
             filteredRepos.map((repo) => (
               <div

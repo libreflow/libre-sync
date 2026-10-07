@@ -89,9 +89,9 @@ function App() {
   // Select-all operates on what the filter actually shows: selecting
   // rows the user cannot see (count larger than the visible list) is
   // more confusing than helpful.
-  const visibleActionable = filteredRepos.filter((r) => ACTIONABLE.includes(r.state));
-  const allActionableSelected =
-    visibleActionable.length > 0 && visibleActionable.every((r) => selected.has(r.name));
+  const visibleRepos = filteredRepos;
+  const allVisibleSelected =
+    visibleRepos.length > 0 && visibleRepos.every((r) => selected.has(r.name));
 
   const toggle = (name: string) => {
     setSelected((prev) => {
@@ -103,9 +103,7 @@ function App() {
   };
 
   const toggleAll = () => {
-    setSelected(
-      allActionableSelected ? new Set() : new Set(visibleActionable.map((r) => r.name)),
-    );
+    setSelected(allVisibleSelected ? new Set() : new Set(visibleRepos.map((r) => r.name)));
   };
 
   const runOn = async (targets: RepoStatus[]) => {
@@ -113,6 +111,19 @@ function App() {
     busyRef.current = true;
     setBusy(true);
     for (const repo of targets) {
+      // Non-actionable states in a batch (user can now select
+      // up-to-date or divergent repos): skip clone/pull attempts that
+      // would fail or do nothing, with an explicit log line instead.
+      if (repo.state === "a-jour" && !repo.dirty) {
+        appendLog(`${repo.name} -- deja a jour, ignore.`);
+        continue;
+      }
+      if (repo.state === "divergent" || repo.state === "erreur") {
+        appendLog(
+          `${repo.name} -- ignore (${STATE_LABEL[repo.state]} : ${repo.detail || "a traiter manuellement"})`,
+        );
+        continue;
+      }
       try {
         // A dirty tree would make pull_repo fail with the dirty-tree
         // guard; behind+dirty repos go straight to the stash-based
@@ -189,16 +200,17 @@ function App() {
     }
   };
 
-  const selectedActionable = repos.filter(
-    (r) => selected.has(r.name) && ACTIONABLE.includes(r.state),
-  );
+  const selectedRepos = repos.filter((r) => selected.has(r.name));
   const activeRepo = repos.find((r) => r.name === activeName) ?? null;
 
-  const primaryTargets = selectedActionable.length > 0 ? selectedActionable : actionableRepos;
+  // Batch target: the selection if any, otherwise every repo needing
+  // work (an all-selected list of up-to-date repos still runs -- pull
+  // is idempotent and answers 'deja a jour').
+  const primaryTargets = selectedRepos.length > 0 ? selectedRepos : actionableRepos;
   const primaryLabel = busy
     ? "En cours..."
-    : selectedActionable.length > 0
-      ? `Cloner / mettre a jour la selection (${selectedActionable.length})`
+    : selectedRepos.length > 0
+      ? `Cloner / mettre a jour la selection (${selectedRepos.length})`
       : actionableRepos.length > 0
         ? `Tout cloner / mettre a jour (${actionableRepos.length})`
         : "Tout est a jour";
@@ -238,13 +250,13 @@ function App() {
         <label className="select-all-row">
           <input
             type="checkbox"
-            checked={allActionableSelected}
+            checked={allVisibleSelected}
             onChange={toggleAll}
-            disabled={loading || busy || visibleActionable.length === 0}
+            disabled={loading || busy || visibleRepos.length === 0}
           />
           Tout selectionner
-          {visibleActionable.length > 0 && (
-            <span className="select-all-count">({visibleActionable.length})</span>
+          {visibleRepos.length > 0 && (
+            <span className="select-all-count">({visibleRepos.length})</span>
           )}
         </label>
 
@@ -270,7 +282,7 @@ function App() {
                   checked={selected.has(repo.name)}
                   onChange={() => toggle(repo.name)}
                   onClick={(e) => e.stopPropagation()}
-                  disabled={busy || !ACTIONABLE.includes(repo.state)}
+                  disabled={busy}
                 />
                 <span className={STATE_DOT[repo.state]} title={STATE_LABEL[repo.state]} />
                 <span className="repo-row-name">{repo.name}</span>

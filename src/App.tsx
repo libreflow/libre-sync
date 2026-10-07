@@ -50,11 +50,16 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [inFlight, setInFlight] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   // Synchronous guard: `busy` (React state) only reflects on the next
   // render, so a double-click before that re-render would start a
   // second concurrent clone/pull loop. This ref flips in the same tick.
   const busyRef = useRef(false);
+  // Cancellation is checked between repos of a batch: the in-flight
+  // subprocess (a clone can run for minutes) is left to finish, then
+  // the loop stops.
+  const cancelRef = useRef(false);
 
   const appendLog = useCallback((entry: string) => {
     const time = new Date().toLocaleTimeString();
@@ -109,19 +114,31 @@ function App() {
   const runOn = async (targets: RepoStatus[]) => {
     if (targets.length === 0 || busyRef.current) return;
     busyRef.current = true;
+    cancelRef.current = false;
     setBusy(true);
+    let ok = 0;
+    let failed = 0;
+    let skipped = 0;
+    let cancelled = false;
     for (const repo of targets) {
+      if (cancelRef.current) {
+        cancelled = true;
+        break;
+      }
+      setInFlight(repo.name);
       // Non-actionable states in a batch (user can now select
       // up-to-date or divergent repos): skip clone/pull attempts that
       // would fail or do nothing, with an explicit log line instead.
       if (repo.state === "a-jour" && !repo.dirty) {
         appendLog(`${repo.name} -- deja a jour, ignore.`);
+        skipped++;
         continue;
       }
       if (repo.state === "divergent" || repo.state === "erreur") {
         appendLog(
           `${repo.name} -- ignore (${STATE_LABEL[repo.state]} : ${repo.detail || "a traiter manuellement"})`,
         );
+        skipped++;
         continue;
       }
       try {
@@ -135,14 +152,25 @@ function App() {
               ? await invoke<string>("stash_pull_repo", { name: repo.name })
               : await invoke<string>("pull_repo", { name: repo.name });
         appendLog(`${repo.name} -- ${msg}`);
+        ok++;
       } catch (e) {
         appendLog(`${repo.name} -- echec : ${String(e)}`);
+        failed++;
       }
     }
+    setInFlight(null);
     busyRef.current = false;
     setBusy(false);
     setSelected(new Set());
+    const parts = [`${ok} reussi(s)`, `${failed} echec(s)`, `${skipped} ignore(s)`];
+    if (cancelled) parts.push("annule apres le depot en cours");
+    appendLog(`Batch termine : ${parts.join(", ")}.`);
     await refresh();
+  };
+
+  const cancelBatch = () => {
+    cancelRef.current = true;
+    appendLog("Annulation demandee -- arret apres le depot en cours...");
   };
 
   const updatePackages = async (repo: RepoStatus) => {
@@ -284,7 +312,11 @@ function App() {
                   onClick={(e) => e.stopPropagation()}
                   disabled={busy}
                 />
-                <span className={STATE_DOT[repo.state]} title={STATE_LABEL[repo.state]} />
+                {inFlight === repo.name ? (
+                  <span className="dot dot-running" title="Operation en cours" />
+                ) : (
+                  <span className={STATE_DOT[repo.state]} title={STATE_LABEL[repo.state]} />
+                )}
                 <span className="repo-row-name">{repo.name}</span>
               </div>
             ))}
@@ -298,6 +330,11 @@ function App() {
           >
             {primaryLabel}
           </button>
+          {busy && (
+            <button className="full-width cancel-btn" onClick={cancelBatch}>
+              Annuler
+            </button>
+          )}
         </div>
       </aside>
 

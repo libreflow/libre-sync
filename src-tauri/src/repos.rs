@@ -344,7 +344,20 @@ pub fn list_repo_status(app: AppHandle) -> Result<Vec<RepoStatus>, String> {
         .map(|repo| std::thread::spawn(move || check_repo(&repo)))
         .collect();
 
-    Ok(handles.into_iter().filter_map(|h| h.join().ok()).collect())
+    let mut statuses: Vec<RepoStatus> = Vec::with_capacity(handles.len());
+    for (handle, repo) in handles.into_iter().zip(cfg.repos.iter()) {
+        match handle.join() {
+            Ok(status) => statuses.push(status),
+            Err(_) => statuses.push(RepoStatus {
+                name: repo.name.clone(),
+                owner: repo.owner.clone(),
+                path: repo.path.clone(),
+                state: "erreur".to_string(),
+                detail: "verification interrompue (thread panique)".to_string(),
+            }),
+        }
+    }
+    Ok(statuses)
 }
 
 #[tauri::command]
@@ -355,6 +368,10 @@ pub fn clone_repo(app: AppHandle, name: String) -> Result<String, String> {
         .iter()
         .find(|r| r.name == name)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
+
+    if Path::new(&repo.path).join(".git").exists() {
+        return Err("Ce depot est deja clone.".to_string());
+    }
 
     if let Some(parent) = Path::new(&repo.path).parent() {
         std::fs::create_dir_all(parent)
@@ -595,16 +612,14 @@ pub fn update_framework(app: AppHandle, name: String) -> Result<String, String> 
                         // API / config schema changes) -- verify rather
                         // than leave that discovery for later.
                         match run_npm(&["run", "build"], &repo.path) {
-                            None => messages.push(
-                                "verification (npm run build) : delai depasse.".to_string(),
-                            ),
+                            None => messages
+                                .push("verification (npm run build) : delai depasse.".to_string()),
                             Some(check) if check.status.success() => {
                                 messages.push("verification : npm run build OK.".to_string())
                             }
                             Some(check) => {
-                                let err = clean_progress_output(&String::from_utf8_lossy(
-                                    &check.stderr,
-                                ));
+                                let err =
+                                    clean_progress_output(&String::from_utf8_lossy(&check.stderr));
                                 messages.push(format!(
                                     "/!\\ verification : npm run build ECHOUE apres la mise a jour -- le projet ne compile plus.\n{err}\nRevert possible: git checkout -- package-lock.json"
                                 ));
@@ -656,7 +671,9 @@ pub fn update_framework(app: AppHandle, name: String) -> Result<String, String> 
                             }
                         ));
                     } else {
-                        messages.push(format!("cargo ({candidate}) {dep_name} : echec -- {stderr}"));
+                        messages.push(format!(
+                            "cargo ({candidate}) {dep_name} : echec -- {stderr}"
+                        ));
                     }
                 }
             }
@@ -698,7 +715,20 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Impossible d'ouvrir l'explorateur: {e}"))?;
     }
-    let _ = path; // avoid an unused-variable warning on non-Windows targets
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Impossible d'ouvrir le Finder: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Impossible d'ouvrir le gestionnaire de fichiers: {e}"))?;
+    }
     Ok(())
 }
 
@@ -751,7 +781,10 @@ serde = { version = "1", features = ["derive"] }
     #[test]
     fn find_tauri_crate_deps_ignores_unrelated_crates_and_comments() {
         let cargo_toml = "[dependencies]\n# tauri-like-but-not = \"1\"\nserde = \"1\"\ntauric-other-crate = \"1\"\n";
-        assert_eq!(find_tauri_crate_deps(cargo_toml), Vec::<(String, bool)>::new());
+        assert_eq!(
+            find_tauri_crate_deps(cargo_toml),
+            Vec::<(String, bool)>::new()
+        );
     }
 
     #[test]
@@ -795,7 +828,9 @@ serde = { version = "1", features = ["derive"] }
             .repos
             .iter()
             .any(|r| r.name == "unbreakable" && r.path == "W:/unbreakable-repo"));
-        assert!(cfg.repos.iter().any(|r| r.name == "local-llm-client"
-            && r.path == "W:/local-llm-client"));
+        assert!(cfg
+            .repos
+            .iter()
+            .any(|r| r.name == "local-llm-client" && r.path == "W:/local-llm-client"));
     }
 }

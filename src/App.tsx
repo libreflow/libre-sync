@@ -10,6 +10,7 @@ interface RepoStatus {
   path: string;
   state: RepoState;
   detail: string;
+  dirty: boolean;
 }
 
 const STATE_LABEL: Record<RepoState, string> = {
@@ -152,6 +153,21 @@ function App() {
     setBusy(false);
   };
 
+  const stashPull = async (repo: RepoStatus) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const msg = await invoke<string>("stash_pull_repo", { name: repo.name });
+      appendLog(`${repo.name} -- ${msg}`);
+    } catch (e) {
+      appendLog(`${repo.name} -- echec : ${String(e)}`);
+    }
+    busyRef.current = false;
+    setBusy(false);
+    await refresh();
+  };
+
   const openInExplorer = async (repo: RepoStatus) => {
     try {
       await invoke("open_in_explorer", { path: repo.path });
@@ -263,10 +279,21 @@ function App() {
             </header>
             <p className="detail-path">{activeRepo.path}</p>
             {activeRepo.detail && <p className="detail-text">{activeRepo.detail}</p>}
+            {activeRepo.dirty && (
+              <p className="detail-text">
+                Modifications locales non commitees (ex. lockfiles mis a jour par les
+                boutons packages / Vite / Tauri) -- elles bloquent la mise a jour simple.
+              </p>
+            )}
             <div className="detail-actions">
               {ACTIONABLE.includes(activeRepo.state) && (
                 <button className="primary" disabled={busy} onClick={() => runOn([activeRepo])}>
                   {busy ? "En cours..." : actionLabel(activeRepo.state)}
+                </button>
+              )}
+              {activeRepo.state === "en-retard" && activeRepo.dirty && (
+                <button disabled={busy} onClick={() => stashPull(activeRepo)}>
+                  {busy ? "En cours..." : "Stasher et mettre a jour"}
                 </button>
               )}
               {activeRepo.state !== "non-clone" && (

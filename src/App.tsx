@@ -37,14 +37,8 @@ function actionLabel(state: RepoState): string {
   switch (state) {
     case "non-clone":
       return "Cloner";
-    case "en-retard":
-      return "Mettre a jour";
-    case "a-jour":
-      return "A jour";
-    case "divergent":
-      return "A traiter manuellement";
     default:
-      return "Verifier";
+      return "Mettre a jour";
   }
 }
 
@@ -185,9 +179,9 @@ function App() {
   const primaryLabel = busy
     ? "En cours..."
     : selectedActionable.length > 0
-      ? `Mettre a jour la selection (${selectedActionable.length})`
+      ? `Cloner / mettre a jour la selection (${selectedActionable.length})`
       : actionableRepos.length > 0
-        ? `Tout mettre a jour (${actionableRepos.length})`
+        ? `Tout cloner / mettre a jour (${actionableRepos.length})`
         : "Tout est a jour";
 
   const summary = {
@@ -286,18 +280,24 @@ function App() {
               </p>
             )}
             <div className="detail-actions">
-              {ACTIONABLE.includes(activeRepo.state) && (
-                <button className="primary" disabled={busy} onClick={() => runOn([activeRepo])}>
-                  {busy ? "En cours..." : actionLabel(activeRepo.state)}
-                </button>
-              )}
-              {activeRepo.state === "en-retard" && activeRepo.dirty && (
-                <button disabled={busy} onClick={() => stashPull(activeRepo)}>
+              {activeRepo.state === "en-retard" && activeRepo.dirty ? (
+                <button
+                  className="primary"
+                  disabled={busy}
+                  title="git stash, pull --ff-only, puis restauration des modifications locales"
+                  onClick={() => stashPull(activeRepo)}
+                >
                   {busy ? "En cours..." : "Stasher et mettre a jour"}
                 </button>
+              ) : (
+                ACTIONABLE.includes(activeRepo.state) && (
+                  <button className="primary" disabled={busy} onClick={() => runOn([activeRepo])}>
+                    {busy ? "En cours..." : actionLabel(activeRepo.state)}
+                  </button>
+                )
               )}
               {activeRepo.state !== "non-clone" && (
-                <button onClick={() => openInExplorer(activeRepo)}>
+                <button disabled={busy} onClick={() => openInExplorer(activeRepo)}>
                   Ouvrir le dossier
                 </button>
               )}

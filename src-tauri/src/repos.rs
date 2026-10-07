@@ -22,11 +22,22 @@ use tauri::{AppHandle, Manager};
 /// way out short of restarting the app.
 const PACKAGE_CMD_TIMEOUT: Duration = Duration::from_secs(150);
 
+const GIT_CMD_TIMEOUT: Duration = Duration::from_secs(300);
+
+const CLONE_CMD_TIMEOUT: Duration = Duration::from_secs(1800);
+
+fn spawn_with_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    rx.recv_timeout(timeout).ok()?.ok()
+}
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Runs `git -C <path> <args>`, suppressing the console window Windows
-/// would otherwise flash for every call from a GUI app.
+/// Runs `git -C <path> <args>`
 fn git(path: &str, args: &[&str]) -> Option<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path).args(args);
@@ -35,10 +46,10 @@ fn git(path: &str, args: &[&str]) -> Option<Output> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.output().ok()
+    spawn_with_timeout(cmd, GIT_CMD_TIMEOUT)
 }
 
-/// Same as `git`, but only for commands run from `path` without
+/// Same as `git`, but for commands run from `path` without
 /// necessarily being inside a repo yet (clone's destination doesn't
 /// exist until the command succeeds, so `-C` would fail before trying).
 fn run(cmd_name: &str, args: &[&str]) -> Option<Output> {
@@ -49,7 +60,21 @@ fn run(cmd_name: &str, args: &[&str]) -> Option<Output> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.output().ok()
+    spawn_with_timeout(cmd, GIT_CMD_TIMEOUT)
+}
+
+/// Clone variant of `run`: uses a longer timeout -- cloning a large
+/// repository over a slow network legitimately takes many minutes; the
+/// shorter `GIT_CMD_TIMEOUT` would kill healthy clones.
+fn run_clone(cmd_name: &str, args: &[&str]) -> Option<Output> {
+    let mut cmd = Command::new(cmd_name);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    spawn_with_timeout(cmd, CLONE_CMD_TIMEOUT)
 }
 
 /// Same as `run`, but in a specific working directory -- for commands
@@ -67,12 +92,7 @@ fn run_in(cmd_name: &str, args: &[&str], cwd: &str) -> Option<Output> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(cmd.output());
-    });
-    rx.recv_timeout(PACKAGE_CMD_TIMEOUT).ok()?.ok()
+    spawn_with_timeout(cmd, PACKAGE_CMD_TIMEOUT)
 }
 
 /// npm on Windows ships as `npm.cmd` (a batch wrapper), not a real
@@ -81,9 +101,16 @@ fn run_in(cmd_name: &str, args: &[&str], cwd: &str) -> Option<Output> {
 /// go through `cmd /c` for npm specifically; `cargo`/`git`/`gh` are real
 /// executables and don't need this.
 fn run_npm(args: &[&str], cwd: &str) -> Option<Output> {
-    let mut full_args: Vec<&str> = vec!["/c", "npm"];
-    full_args.extend_from_slice(args);
-    run_in("cmd", &full_args, cwd)
+    #[cfg(windows)]
+    {
+        let mut full_args: Vec<&str> = vec!["/c", "npm"];
+        full_args.extend_from_slice(args);
+        run_in("cmd", &full_args, cwd)
+    }
+    #[cfg(not(windows))]
+    {
+        run_in("npm", args, cwd)
+    }
 }
 
 /// npm/cargo render progress bars by repeatedly overwriting the current
@@ -250,7 +277,12 @@ fn check_repo(repo: &RepoConfig) -> RepoStatus {
 
     git(&repo.path, &["fetch", "--quiet"]);
     let local = git_capture(&repo.path, &["rev-parse", "HEAD"]);
-    let upstream = git_capture(&repo.path, &["rev-parse", "@{u}"]);
+    let detached = git_capture(&repo.path, &["symbolic-ref", "-q", "HEAD"]).is_none();
+    let upstream = if detached {
+        None
+    } else {
+        git_capture(&repo.path, &["rev-parse", "@{u}"])
+    };
 
     let (ahead, behind) = match (&local, &upstream) {
         (Some(l), Some(u)) if l != u => {
@@ -295,9 +327,10 @@ fn sync_from_github(cfg: &mut HubConfig) {
             "list",
             &cfg.default_owner,
             "--limit",
-            "100",
+            "1000",
             "--json",
             "name",
+            "owner",
         ],
     ) else {
         return;
@@ -315,12 +348,20 @@ fn sync_from_github(cfg: &mut HubConfig) {
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
-        if cfg.repos.iter().any(|r| r.name == name) {
+        let owner = item
+            .get("owner")
+            .and_then(|o| o.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&cfg.default_owner);
+        // Compare on the (name, owner) pair, not the name alone: two
+        // different accounts can own same-named repos, and a name-only
+        // match would silently skip a genuinely new (or forked) repo.
+        if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
             continue;
         }
         cfg.repos.push(RepoConfig {
             name: name.to_string(),
-            owner: cfg.default_owner.clone(),
+            owner: owner.to_string(),
             path: format!("{}{}", cfg.default_base_dir, name),
         });
     }
@@ -379,7 +420,7 @@ pub fn clone_repo(app: AppHandle, name: String) -> Result<String, String> {
     }
 
     let output = if gh_available() {
-        run(
+        run_clone(
             "gh",
             &[
                 "repo",
@@ -390,9 +431,9 @@ pub fn clone_repo(app: AppHandle, name: String) -> Result<String, String> {
         )
     } else {
         let url = format!("https://github.com/{}/{}.git", repo.owner, repo.name);
-        run("git", &["clone", &url, &repo.path])
+        run_clone("git", &["clone", &url, &repo.path])
     }
-    .ok_or_else(|| "Impossible de lancer git/gh.".to_string())?;
+    .ok_or_else(|| "Impossible de lancer git/gh, ou delai depasse.".to_string())?;
 
     if output.status.success() {
         Ok(format!("clone avec succes dans {}", repo.path))
@@ -410,10 +451,23 @@ pub fn pull_repo(app: AppHandle, name: String) -> Result<String, String> {
         .find(|r| r.name == name)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
 
-    if let Some(dirty) = git_capture(
+    // Check the worktree through git itself rather than piggybacking on
+    // git_capture: git_capture returns None for both "clean tree" and
+    // "git status failed" (e.g. a corrupted repo), and a failed status
+    // check must not be mistaken for a clean, pullable tree.
+    let status_out = git(
         &repo.path,
         &["status", "--porcelain", "--untracked-files=no"],
-    ) {
+    )
+    .ok_or_else(|| "Impossible de lancer git.".to_string())?;
+    if !status_out.status.success() {
+        return Err(format!(
+            "git status a echoue -- mise a jour annulee:\n{}",
+            String::from_utf8_lossy(&status_out.stderr).trim()
+        ));
+    }
+    let dirty = String::from_utf8_lossy(&status_out.stdout).trim().to_string();
+    if !dirty.is_empty() {
         return Err(format!(
             "Modifications locales non enregistrees -- mise a jour annulee:\n{dirty}"
         ));
@@ -524,12 +578,24 @@ pub fn update_packages(app: AppHandle, name: String) -> Result<String, String> {
 /// and pulling in a full TOML-parsing crate for this one scan isn't
 /// worth the extra dependency.
 fn find_tauri_crate_deps(cargo_toml: &str) -> Vec<(String, bool)> {
-    let mut section_is_build = false;
+    // false = [dependencies], true = [build-dependencies], None = any
+    // other section ([package], [features], [workspace.dependencies],
+    // [target.'cfg(...)'.dependencies], ...) -- a `tauri` key there is
+    // either metadata or a shared workspace definition, never a plain
+    // dependency this manifest's `cargo add` should touch.
+    let mut section: Option<bool> = None;
     let mut found = Vec::new();
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            section_is_build = trimmed == "[build-dependencies]";
+            section = match trimmed {
+                "[dependencies]" => Some(false),
+                "[build-dependencies]" => Some(true),
+                _ => None,
+            };
+            continue;
+        }
+        if section.is_none() {
             continue;
         }
         if !trimmed.starts_with("tauri") {
@@ -538,7 +604,7 @@ fn find_tauri_crate_deps(cargo_toml: &str) -> Vec<(String, bool)> {
         if let Some(key) = trimmed.split('=').next() {
             let key = key.trim();
             if key == "tauri" || key == "tauri-build" || key.starts_with("tauri-plugin-") {
-                found.push((key.to_string(), section_is_build));
+                found.push((key.to_string(), section == Some(true)));
             }
         }
     }
@@ -621,7 +687,7 @@ pub fn update_framework(app: AppHandle, name: String) -> Result<String, String> 
                                 let err =
                                     clean_progress_output(&String::from_utf8_lossy(&check.stderr));
                                 messages.push(format!(
-                                    "/!\\ verification : npm run build ECHOUE apres la mise a jour -- le projet ne compile plus.\n{err}\nRevert possible: git checkout -- package-lock.json"
+                                    "/!\\ verification : npm run build ECHOUE apres la mise a jour -- le projet ne compile plus.\n{err}\nRevert possible : git checkout -- package.json package-lock.json"
                                 ));
                             }
                         }
@@ -693,7 +759,7 @@ pub fn update_framework(app: AppHandle, name: String) -> Result<String, String> 
                 let err = clean_progress_output(&String::from_utf8_lossy(&check.stderr));
                 let lockfile = candidate.replace("Cargo.toml", "Cargo.lock");
                 messages.push(format!(
-                    "/!\\ verification : cargo check ECHOUE apres la mise a jour -- le projet ne compile plus.\n{err}\nRevert possible : git checkout -- {lockfile}"
+                    "/!\\ verification : cargo check ECHOUE apres la mise a jour -- le projet ne compile plus.\n{err}\nRevert possible : git checkout -- {candidate} {lockfile}"
                 ));
             }
         }
@@ -708,6 +774,9 @@ pub fn update_framework(app: AppHandle, name: String) -> Result<String, String> 
 
 #[tauri::command]
 pub fn open_in_explorer(path: String) -> Result<(), String> {
+    if !Path::new(&path).exists() {
+        return Err(format!("Le chemin n'existe pas : {path}"));
+    }
     #[cfg(windows)]
     {
         Command::new("explorer")

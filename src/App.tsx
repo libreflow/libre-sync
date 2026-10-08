@@ -33,6 +33,12 @@ const ACTIONABLE: RepoState[] = ["non-clone", "en-retard"];
 
 const LOG_MAX_ENTRIES = 200;
 
+interface RepoForm {
+  name: string;
+  owner: string;
+  path: string;
+}
+
 function actionLabel(state: RepoState): string {
   switch (state) {
     case "non-clone":
@@ -60,6 +66,10 @@ function App() {
   // subprocess (a clone can run for minutes) is left to finish, then
   // the loop stops.
   const cancelRef = useRef(false);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newRepo, setNewRepo] = useState<RepoForm>({ name: "", owner: "", path: "" });
+  const [editingPath, setEditingPath] = useState<string | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState(false);
 
   const appendLog = useCallback((entry: string) => {
     const time = new Date().toLocaleTimeString();
@@ -220,6 +230,66 @@ function App() {
     await refresh();
   };
 
+  const addRepo = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const msg = await invoke<string>("add_repo", {
+        name: newRepo.name,
+        owner: newRepo.owner,
+        path: newRepo.path,
+      });
+      appendLog(msg);
+      setShowAddForm(false);
+      setNewRepo({ name: "", owner: "", path: "" });
+      await refresh();
+    } catch (e) {
+      appendLog(`Ajout impossible : ${String(e)}`);
+    }
+    busyRef.current = false;
+    setBusy(false);
+  };
+
+  const removeRepo = async (repo: RepoStatus) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const msg = await invoke<string>("remove_repo", {
+        name: repo.name,
+        owner: repo.owner,
+      });
+      appendLog(`${repo.name} -- ${msg}`);
+      setActiveName(null);
+      await refresh();
+    } catch (e) {
+      appendLog(`${repo.name} -- retrait impossible : ${String(e)}`);
+    }
+    busyRef.current = false;
+    setBusy(false);
+  };
+
+  const updateRepoPath = async (repo: RepoStatus, path: string) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const msg = await invoke<string>("update_repo_path", {
+        name: repo.name,
+        owner: repo.owner,
+        path,
+      });
+      appendLog(`${repo.name} -- ${msg}`);
+      setEditingPath(null);
+      await refresh();
+    } catch (e) {
+      appendLog(`${repo.name} -- modification du chemin impossible : ${String(e)}`);
+    }
+    busyRef.current = false;
+    setBusy(false);
+  };
+
   const openInExplorer = async (repo: RepoStatus) => {
     try {
       await invoke("open_in_explorer", { path: repo.path });
@@ -273,7 +343,47 @@ function App() {
           >
             {"\u27F3"}
           </button>
+          <button
+            className="icon-btn"
+            onClick={() => setShowAddForm((v) => !v)}
+            disabled={loading || busy}
+            title="Ajouter un depot"
+            aria-label="Ajouter un depot"
+          >
+            +
+          </button>
         </div>
+
+        {showAddForm && (
+          <div className="add-form">
+            <input
+              className="filter-input"
+              placeholder="Nom du depot"
+              value={newRepo.name}
+              onChange={(e) => setNewRepo((f) => ({ ...f, name: e.target.value }))}
+            />
+            <input
+              className="filter-input"
+              placeholder="Owner"
+              value={newRepo.owner}
+              onChange={(e) => setNewRepo((f) => ({ ...f, owner: e.target.value }))}
+            />
+            <input
+              className="filter-input"
+              placeholder="Chemin local (ex: W:/mon-depot)"
+              value={newRepo.path}
+              onChange={(e) => setNewRepo((f) => ({ ...f, path: e.target.value }))}
+            />
+            <div className="add-form-actions">
+              <button disabled={busy} onClick={addRepo}>
+                Ajouter
+              </button>
+              <button disabled={busy} onClick={() => setShowAddForm(false)}>
+                Annuler
+              </button>
+            </div>
+          </div>
+        )}
 
         <label className="select-all-row">
           <input
@@ -346,7 +456,35 @@ function App() {
               <span className={STATE_DOT[activeRepo.state]} />
               <span className="detail-state-label">{STATE_LABEL[activeRepo.state]}</span>
             </header>
-            <p className="detail-path">{activeRepo.path}</p>
+            {editingPath === activeRepo.name ? (
+              <div className="path-edit">
+                <input
+                  className="filter-input"
+                  value={newRepo.path}
+                  onChange={(e) => setNewRepo((f) => ({ ...f, path: e.target.value }))}
+                />
+                <button disabled={busy} onClick={() => updateRepoPath(activeRepo, newRepo.path)}>
+                  Enregistrer
+                </button>
+                <button disabled={busy} onClick={() => setEditingPath(null)}>
+                  Annuler
+                </button>
+              </div>
+            ) : (
+              <p className="detail-path">
+                {activeRepo.path}{" "}
+                <button
+                  className="link-btn"
+                  disabled={busy}
+                  onClick={() => {
+                    setNewRepo((f) => ({ ...f, path: activeRepo.path }));
+                    setEditingPath(activeRepo.name);
+                  }}
+                >
+                  modifier
+                </button>
+              </p>
+            )}
             {activeRepo.detail && <p className="detail-text">{activeRepo.detail}</p>}
             {activeRepo.dirty && (
               <p className="detail-text">
@@ -388,6 +526,20 @@ function App() {
                   onClick={() => updateFramework(activeRepo)}
                 >
                   {busy ? "En cours..." : "Mettre a jour Vite / Tauri"}
+                </button>
+              )}
+              {confirmRemove ? (
+                <>
+                  <button className="danger-btn" disabled={busy} onClick={() => removeRepo(activeRepo)}>
+                    Confirmer le retrait
+                  </button>
+                  <button disabled={busy} onClick={() => setConfirmRemove(false)}>
+                    Ne pas retirer
+                  </button>
+                </>
+              ) : (
+                <button disabled={busy} onClick={() => setConfirmRemove(true)}>
+                  Retirer de la liste
                 </button>
               )}
             </div>

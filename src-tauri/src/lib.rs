@@ -6,6 +6,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             repos::list_repo_status,
+            repos::add_repo,
+            repos::remove_repo,
+            repos::update_repo_path,
             repos::clone_repo,
             repos::pull_repo,
             repos::stash_pull_repo,

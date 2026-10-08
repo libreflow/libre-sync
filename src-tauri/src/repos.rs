@@ -414,6 +414,87 @@ pub fn list_repo_status(app: AppHandle) -> Result<Vec<RepoStatus>, String> {
     Ok(statuses)
 }
 
+/// Add a repo to the config. Rejects an entry that already exists --
+/// same (name, owner) pair -- so a manual add can never create the
+/// duplicate sync_from_github's dedup guards against.
+#[tauri::command]
+pub fn add_repo(
+    app: AppHandle,
+    name: String,
+    owner: String,
+    path: String,
+) -> Result<String, String> {
+    let name = name.trim();
+    let owner = owner.trim();
+    let path = path.trim();
+    if name.is_empty() || owner.is_empty() || path.is_empty() {
+        return Err("Nom, owner et chemin sont obligatoires.".to_string());
+    }
+    let mut cfg = load_config(&app)?;
+    if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
+        return Err(format!("{owner}/{name} est deja dans la configuration."));
+    }
+    cfg.repos.push(RepoConfig {
+        name: name.to_string(),
+        owner: owner.to_string(),
+        path: path.to_string(),
+    });
+    save_config(&app, &cfg)?;
+    Ok(format!("{owner}/{name} ajoute ({path})."))
+}
+
+/// Remove a repo from the config. Never touches the clone on disk --
+/// removing an entry must not look like it deletes the working copy.
+#[tauri::command]
+pub fn remove_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+    let mut cfg = load_config(&app)?;
+    let before = cfg.repos.len();
+    cfg.repos.retain(|r| !(r.name == name && r.owner == owner));
+    if cfg.repos.len() == before {
+        return Err(format!("{owner}/{name} n'est pas dans la configuration."));
+    }
+    save_config(&app, &cfg)?;
+    Ok(format!(
+        "{owner}/{name} retire de la configuration (le dossier local n'a pas ete touche)."
+    ))
+}
+
+/// Edit a repo's local path -- the "I moved my clone" case. Rejects a
+/// path that would collide with another entry's path.
+#[tauri::command]
+pub fn update_repo_path(
+    app: AppHandle,
+    name: String,
+    owner: String,
+    path: String,
+) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Le chemin est obligatoire.".to_string());
+    }
+    let mut cfg = load_config(&app)?;
+    if cfg
+        .repos
+        .iter()
+        .any(|r| r.name != name && r.owner == owner && r.path == path)
+    {
+        return Err(format!(
+            "Le chemin {path} est deja utilise par un autre depot."
+        ));
+    }
+    let repo = cfg
+        .repos
+        .iter_mut()
+        .find(|r| r.name == name && r.owner == owner)
+        .ok_or_else(|| format!("{owner}/{name} n'est pas dans la configuration."))?;
+    let old = repo.path.clone();
+    repo.path = path.to_string();
+    save_config(&app, &cfg)?;
+    Ok(format!(
+        "Chemin de {owner}/{name} mis a jour : {old} -> {path}"
+    ))
+}
+
 #[tauri::command]
 pub fn clone_repo(app: AppHandle, name: String) -> Result<String, String> {
     let cfg = load_config(&app)?;

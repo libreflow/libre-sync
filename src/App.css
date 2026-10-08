@@ -336,6 +336,59 @@ button.primary:hover:not(:disabled) {
   color: #f85149;
 }
 
+/* ---------- Add-repo form ---------- */
+
+.add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
+
+.add-form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ---------- Detail path edit / remove ---------- */
+
+.path-edit {
+  display: flex;
+  gap: 8px;
+  margin: 2px 0 10px;
+}
+
+.path-edit .filter-input {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #58a6ff;
+  padding: 0 4px;
+  font-size: 0.78rem;
+  font-weight: 400;
+}
+
+.link-btn:hover:not(:disabled) {
+  background: none;
+  border: none;
+  text-decoration: underline;
+}
+
+.danger-btn {
+  background: transparent;
+  border-color: #f85149;
+  color: #f85149;
+}
+
+.danger-btn:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.12);
+  border-color: #f85149;
+}
+
 /* ---------- Log ---------- */
 
 .log {

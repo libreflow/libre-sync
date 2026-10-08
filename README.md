@@ -31,9 +31,7 @@ Au premier lancement, un fichier `repos.json` est créé dans le dossier de conf
 {
   "defaultBaseDir": "W:/",
   "defaultOwner": "libreflow",
-  "repos": [
-    { "name": "mon-repo", "owner": "libreflow", "path": "W:/mon-repo" }
-  ]
+  "repos": [{ "name": "mon-repo", "owner": "libreflow", "path": "W:/mon-repo" }]
 }
 ```
 
@@ -43,13 +41,13 @@ Au premier lancement, un fichier `repos.json` est créé dans le dossier de conf
 
 ## États des dépôts
 
-| État | Signification | Action |
-|---|---|---|
-| `a-jour` | Identique à l'amont | — |
-| `en-retard` | Des commits à récupérer | `git pull --ff-only` |
-| `non-clone` | Pas de clone local | `gh repo clone` ou `git clone` |
-| `divergent` | Commits locaux non poussés | À traiter manuellement |
-| `erreur` | Pas d'amont configuré / vérification échouée | À vérifier |
+| État        | Signification                                | Action                         |
+| ----------- | -------------------------------------------- | ------------------------------ |
+| `a-jour`    | Identique à l'amont                          | —                              |
+| `en-retard` | Des commits à récupérer                      | `git pull --ff-only`           |
+| `non-clone` | Pas de clone local                           | `gh repo clone` ou `git clone` |
+| `divergent` | Commits locaux non poussés                   | À traiter manuellement         |
+| `erreur`    | Pas d'amont configuré / vérification échouée | À vérifier                     |
 
 ## Philosophie de mise à jour
 

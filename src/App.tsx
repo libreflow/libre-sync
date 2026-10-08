@@ -126,9 +126,7 @@ function App() {
   };
 
   const toggleAll = () => {
-    setSelected(
-      allVisibleSelected ? new Set() : new Set(visibleRepos.map(repoId)),
-    );
+    setSelected(allVisibleSelected ? new Set() : new Set(visibleRepos.map(repoId)));
   };
 
   const runOn = async (targets: RepoStatus[]) => {
@@ -499,8 +497,8 @@ function App() {
             {activeRepo.detail && <p className="detail-text">{activeRepo.detail}</p>}
             {activeRepo.dirty && (
               <p className="detail-text">
-                Modifications locales non commitees (ex. lockfiles mis a jour par les
-                boutons packages / Vite / Tauri) -- elles bloquent la mise a jour simple.
+                Modifications locales non commitees (ex. lockfiles mis a jour par les boutons
+                packages / Vite / Tauri) -- elles bloquent la mise a jour simple.
               </p>
             )}
             <div className="detail-actions">
@@ -541,7 +539,11 @@ function App() {
               )}
               {confirmRemove ? (
                 <>
-                  <button className="danger-btn" disabled={busy} onClick={() => removeRepo(activeRepo)}>
+                  <button
+                    className="danger-btn"
+                    disabled={busy}
+                    onClick={() => removeRepo(activeRepo)}
+                  >
                     Confirmer le retrait
                   </button>
                   <button disabled={busy} onClick={() => setConfirmRemove(false)}>
@@ -559,8 +561,8 @@ function App() {
           <div className="welcome">
             <h2>Tous tes depots, d'un seul endroit</h2>
             <p className="subtitle">
-              Clique un depot a gauche pour le detail, ou utilise la selection pour tout
-              mettre a jour d'un coup -- sur cette machine ou une neuve.
+              Clique un depot a gauche pour le detail, ou utilise la selection pour tout mettre a
+              jour d'un coup -- sur cette machine ou une neuve.
             </p>
             <div className="summary-grid">
               <div className="summary-card">

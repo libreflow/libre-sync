@@ -277,7 +277,12 @@ fn check_repo(repo: &RepoConfig) -> RepoStatus {
         };
     }
 
-    git(&repo.path, &["fetch", "--quiet"]);
+    // A failed fetch (offline, auth expired) leaves the remote refs
+    // stale: the state below may then claim "a-jour" off outdated
+    // data. Surface it in the detail instead of failing silently.
+    let fetch_ok = git(&repo.path, &["fetch", "--quiet"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     let local = git_capture(&repo.path, &["rev-parse", "HEAD"]);
     let detached = git_capture(&repo.path, &["symbolic-ref", "-q", "HEAD"]).is_none();
     // Surfaced to the UI so it can offer stash_pull_repo -- the app's
@@ -309,6 +314,13 @@ fn check_repo(repo: &RepoConfig) -> RepoStatus {
     };
 
     let (state, detail) = classify_state(local.as_deref(), upstream.as_deref(), ahead, behind);
+    let detail = if fetch_ok {
+        detail
+    } else if detail.is_empty() {
+        "fetch impossible (hors ligne ?) -- etat potentiellement obsolete".to_string()
+    } else {
+        format!("{detail} (fetch impossible -- etat potentiellement obsolete)")
+    };
     RepoStatus {
         name: repo.name.clone(),
         owner: repo.owner.clone(),
@@ -496,12 +508,12 @@ pub fn update_repo_path(
 }
 
 #[tauri::command]
-pub fn clone_repo(app: AppHandle, name: String) -> Result<String, String> {
+pub fn clone_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
         .iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name && r.owner == owner)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
 
     if Path::new(&repo.path).join(".git").exists() {
@@ -537,12 +549,12 @@ pub fn clone_repo(app: AppHandle, name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn pull_repo(app: AppHandle, name: String) -> Result<String, String> {
+pub fn pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
         .iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name && r.owner == owner)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
 
     // Check the worktree through git itself rather than piggybacking on
@@ -593,31 +605,48 @@ pub fn pull_repo(app: AppHandle, name: String) -> Result<String, String> {
 /// conflicts, the stash entry is kept -- the user resolves by hand and
 /// no work is silently dropped.
 #[tauri::command]
-pub fn stash_pull_repo(app: AppHandle, name: String) -> Result<String, String> {
+pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
         .iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name && r.owner == owner)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
 
     if !Path::new(&repo.path).join(".git").exists() {
         return Err("Ce depot n'est pas encore clone.".to_string());
     }
 
-    let stash_out = git(&repo.path, &["stash", "push", "-m", "libre-sync pull"])
-        .ok_or_else(|| "Impossible de lancer git.".to_string())?;
-    if !stash_out.status.success() {
+    // Decide stash necessity from the porcelain status itself, not from
+    // parsing git's stdout: on a clean tree `git stash push` exits 0 but
+    // creates no stash entry, and its "No local changes to save" message
+    // is localized (a French git says something else) -- popping a stash
+    // that was never created would then report a false failure.
+    let status_out = git(
+        &repo.path,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .ok_or_else(|| "Impossible de lancer git.".to_string())?;
+    if !status_out.status.success() {
         return Err(format!(
-            "git stash a echoue -- mise a jour annulee:\n{}",
-            String::from_utf8_lossy(&stash_out.stderr).trim()
+            "git status a echoue -- mise a jour annulee:\n{}",
+            String::from_utf8_lossy(&status_out.stderr).trim()
         ));
     }
-    // On a clean tree `git stash push` exits 0 but creates no stash
-    // entry ("No local changes to save") -- popping then would fail.
-    let stash_created = !String::from_utf8_lossy(&stash_out.stdout)
+    let needs_stash = !String::from_utf8_lossy(&status_out.stdout)
         .trim()
-        .contains("No local changes to save");
+        .is_empty();
+
+    if needs_stash {
+        let stash_out = git(&repo.path, &["stash", "push", "-m", "libre-sync pull"])
+            .ok_or_else(|| "Impossible de lancer git.".to_string())?;
+        if !stash_out.status.success() {
+            return Err(format!(
+                "git stash a echoue -- mise a jour annulee:\n{}",
+                String::from_utf8_lossy(&stash_out.stderr).trim()
+            ));
+        }
+    }
 
     let pull_out = git(&repo.path, &["pull", "--ff-only"]);
     let pull_msg = match pull_out {
@@ -642,7 +671,7 @@ pub fn stash_pull_repo(app: AppHandle, name: String) -> Result<String, String> {
         }
     };
 
-    if stash_created {
+    if needs_stash {
         let pop_out = git(&repo.path, &["stash", "pop"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !pop_out.status.success() {
@@ -653,7 +682,7 @@ pub fn stash_pull_repo(app: AppHandle, name: String) -> Result<String, String> {
         }
     }
 
-    Ok(if stash_created {
+    Ok(if needs_stash {
         format!("{pull_msg}\n(modifications locales mises de cote puis restaurees)")
     } else {
         pull_msg
@@ -668,12 +697,12 @@ pub fn stash_pull_repo(app: AppHandle, name: String) -> Result<String, String> {
 /// resulting lockfile changes uncommitted in the working tree, same as
 /// any other local edit -- this command never commits or pushes.
 #[tauri::command]
-pub fn update_packages(app: AppHandle, name: String) -> Result<String, String> {
+pub fn update_packages(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
         .iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name && r.owner == owner)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
 
     if !Path::new(&repo.path).join(".git").exists() {
@@ -795,12 +824,12 @@ fn find_tauri_crate_deps(cargo_toml: &str) -> Vec<(String, bool)> {
 /// `update_packages`: this never commits or pushes, the user reviews
 /// and tests before committing.
 #[tauri::command]
-pub fn update_framework(app: AppHandle, name: String) -> Result<String, String> {
+pub fn update_framework(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
         .iter()
-        .find(|r| r.name == name)
+        .find(|r| r.name == name && r.owner == owner)
         .ok_or_else(|| "Depot inconnu.".to_string())?;
 
     if !Path::new(&repo.path).join(".git").exists() {

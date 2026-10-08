@@ -31,6 +31,13 @@ const STATE_DOT: Record<RepoState, string> = {
 
 const ACTIONABLE: RepoState[] = ["non-clone", "en-retard"];
 
+// Repos are identified by owner/name: same-named repos from two
+// different owners are valid, and every keyed structure below must
+// use the pair (React keys, selection, active, in-flight, editing).
+function repoId(repo: { name: string; owner: string }): string {
+  return `${repo.owner}/${repo.name}`;
+}
+
 const LOG_MAX_ENTRIES = 200;
 
 interface RepoForm {
@@ -69,6 +76,7 @@ function App() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [newRepo, setNewRepo] = useState<RepoForm>({ name: "", owner: "", path: "" });
   const [editingPath, setEditingPath] = useState<string | null>(null);
+  const [pathDraft, setPathDraft] = useState("");
   const [confirmRemove, setConfirmRemove] = useState(false);
 
   const appendLog = useCallback((entry: string) => {
@@ -106,19 +114,21 @@ function App() {
   // more confusing than helpful.
   const visibleRepos = filteredRepos;
   const allVisibleSelected =
-    visibleRepos.length > 0 && visibleRepos.every((r) => selected.has(r.name));
+    visibleRepos.length > 0 && visibleRepos.every((r) => selected.has(repoId(r)));
 
-  const toggle = (name: string) => {
+  const toggle = (id: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   };
 
   const toggleAll = () => {
-    setSelected(allVisibleSelected ? new Set() : new Set(visibleRepos.map((r) => r.name)));
+    setSelected(
+      allVisibleSelected ? new Set() : new Set(visibleRepos.map(repoId)),
+    );
   };
 
   const runOn = async (targets: RepoStatus[]) => {
@@ -135,7 +145,7 @@ function App() {
         cancelled = true;
         break;
       }
-      setInFlight(repo.name);
+      setInFlight(repoId(repo));
       // Non-actionable states in a batch (user can now select
       // up-to-date or divergent repos): skip clone/pull attempts that
       // would fail or do nothing, with an explicit log line instead.
@@ -155,12 +165,13 @@ function App() {
         // A dirty tree would make pull_repo fail with the dirty-tree
         // guard; behind+dirty repos go straight to the stash-based
         // update so the batch doesn't stall on them one by one.
+        const args = { name: repo.name, owner: repo.owner };
         const msg =
           repo.state === "non-clone"
-            ? await invoke<string>("clone_repo", { name: repo.name })
+            ? await invoke<string>("clone_repo", args)
             : repo.dirty
-              ? await invoke<string>("stash_pull_repo", { name: repo.name })
-              : await invoke<string>("pull_repo", { name: repo.name });
+              ? await invoke<string>("stash_pull_repo", args)
+              : await invoke<string>("pull_repo", args);
         appendLog(`${repo.name} -- ${msg}`);
         ok++;
       } catch (e) {
@@ -188,7 +199,7 @@ function App() {
     busyRef.current = true;
     setBusy(true);
     try {
-      const msg = await invoke<string>("update_packages", { name: repo.name });
+      const msg = await invoke<string>("update_packages", { name: repo.name, owner: repo.owner });
       appendLog(`${repo.name} -- ${msg}`);
     } catch (e) {
       appendLog(`${repo.name} -- echec packages : ${String(e)}`);
@@ -205,7 +216,7 @@ function App() {
     busyRef.current = true;
     setBusy(true);
     try {
-      const msg = await invoke<string>("update_framework", { name: repo.name });
+      const msg = await invoke<string>("update_framework", { name: repo.name, owner: repo.owner });
       appendLog(`${repo.name} -- ${msg}`);
     } catch (e) {
       appendLog(`${repo.name} -- echec Vite/Tauri : ${String(e)}`);
@@ -220,7 +231,7 @@ function App() {
     busyRef.current = true;
     setBusy(true);
     try {
-      const msg = await invoke<string>("stash_pull_repo", { name: repo.name });
+      const msg = await invoke<string>("stash_pull_repo", { name: repo.name, owner: repo.owner });
       appendLog(`${repo.name} -- ${msg}`);
     } catch (e) {
       appendLog(`${repo.name} -- echec : ${String(e)}`);
@@ -298,8 +309,8 @@ function App() {
     }
   };
 
-  const selectedRepos = repos.filter((r) => selected.has(r.name));
-  const activeRepo = repos.find((r) => r.name === activeName) ?? null;
+  const selectedRepos = repos.filter((r) => selected.has(repoId(r)));
+  const activeRepo = repos.find((r) => repoId(r) === activeName) ?? null;
 
   // Batch target: the selection if any, otherwise every repo needing
   // work (an all-selected list of up-to-date repos still runs -- pull
@@ -411,18 +422,18 @@ function App() {
           {!loading &&
             filteredRepos.map((repo) => (
               <div
-                key={repo.name}
-                className={`repo-row${activeName === repo.name ? " active" : ""}`}
-                onClick={() => setActiveName(repo.name)}
+                key={repoId(repo)}
+                className={`repo-row${activeName === repoId(repo) ? " active" : ""}`}
+                onClick={() => setActiveName(repoId(repo))}
               >
                 <input
                   type="checkbox"
-                  checked={selected.has(repo.name)}
-                  onChange={() => toggle(repo.name)}
+                  checked={selected.has(repoId(repo))}
+                  onChange={() => toggle(repoId(repo))}
                   onClick={(e) => e.stopPropagation()}
                   disabled={busy}
                 />
-                {inFlight === repo.name ? (
+                {inFlight === repoId(repo) ? (
                   <span className="dot dot-running" title="Operation en cours" />
                 ) : (
                   <span className={STATE_DOT[repo.state]} title={STATE_LABEL[repo.state]} />
@@ -456,14 +467,14 @@ function App() {
               <span className={STATE_DOT[activeRepo.state]} />
               <span className="detail-state-label">{STATE_LABEL[activeRepo.state]}</span>
             </header>
-            {editingPath === activeRepo.name ? (
+            {editingPath === repoId(activeRepo) ? (
               <div className="path-edit">
                 <input
                   className="filter-input"
-                  value={newRepo.path}
-                  onChange={(e) => setNewRepo((f) => ({ ...f, path: e.target.value }))}
+                  value={pathDraft}
+                  onChange={(e) => setPathDraft(e.target.value)}
                 />
-                <button disabled={busy} onClick={() => updateRepoPath(activeRepo, newRepo.path)}>
+                <button disabled={busy} onClick={() => updateRepoPath(activeRepo, pathDraft)}>
                   Enregistrer
                 </button>
                 <button disabled={busy} onClick={() => setEditingPath(null)}>
@@ -477,8 +488,8 @@ function App() {
                   className="link-btn"
                   disabled={busy}
                   onClick={() => {
-                    setNewRepo((f) => ({ ...f, path: activeRepo.path }));
-                    setEditingPath(activeRepo.name);
+                    setPathDraft(activeRepo.path);
+                    setEditingPath(repoId(activeRepo));
                   }}
                 >
                   modifier

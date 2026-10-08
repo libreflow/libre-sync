@@ -130,6 +130,34 @@ fn clean_progress_output(raw: &str) -> String {
         .join("\n")
 }
 
+/// Wrapper over `git` for commands that write the index (status,
+/// stash, pull...): another git process holding `.git/index.lock` --
+/// typically an IDE's git extension polling the same repo -- makes the
+/// call fail instantly with "could not write index" / "index.lock exists".
+/// Observed in practice as a burst of instant stash failures. Retry a
+/// few times with growing delay; other errors are returned as-is.
+fn git_write(path: &str, args: &[&str]) -> Option<Output> {
+    const LOCK_RETRIES: usize = 3;
+    let delays = [150, 500, 1000];
+    let mut last = git(path, args);
+    for (attempt, delay) in (0..LOCK_RETRIES).zip(delays) {
+        let failed_on_lock = match &last {
+            Some(out) => {
+                !out.status.success()
+                    && String::from_utf8_lossy(&out.stderr).contains("could not write index")
+            }
+            None => false,
+        };
+        if !failed_on_lock {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(delay));
+        last = git(path, args);
+        let _ = attempt;
+    }
+    last
+}
+
 /// stdout of a successful git call, trimmed; `None` on any failure or
 /// empty output (empty porcelain status, no upstream configured, etc.)
 fn git_capture(path: &str, args: &[&str]) -> Option<String> {
@@ -288,7 +316,7 @@ fn check_repo(repo: &RepoConfig) -> RepoStatus {
     // Surfaced to the UI so it can offer stash_pull_repo -- the app's
     // own package/framework updates leave uncommitted lockfile changes
     // that block pull_repo by design.
-    let dirty = git(
+    let dirty = git_write(
         &repo.path,
         &["status", "--porcelain", "--untracked-files=no"],
     )
@@ -561,7 +589,7 @@ pub fn pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, 
     // git_capture: git_capture returns None for both "clean tree" and
     // "git status failed" (e.g. a corrupted repo), and a failed status
     // check must not be mistaken for a clean, pullable tree.
-    let status_out = git(
+    let status_out = git_write(
         &repo.path,
         &["status", "--porcelain", "--untracked-files=no"],
     )
@@ -581,7 +609,7 @@ pub fn pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, 
         ));
     }
 
-    let output = git(&repo.path, &["pull", "--ff-only"])
+    let output = git_write(&repo.path, &["pull", "--ff-only"])
         .ok_or_else(|| "Impossible de lancer git.".to_string())?;
 
     if output.status.success() {
@@ -622,7 +650,7 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
     // creates no stash entry, and its "No local changes to save" message
     // is localized (a French git says something else) -- popping a stash
     // that was never created would then report a false failure.
-    let status_out = git(
+    let status_out = git_write(
         &repo.path,
         &["status", "--porcelain", "--untracked-files=no"],
     )
@@ -638,17 +666,24 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
         .is_empty();
 
     if needs_stash {
-        let stash_out = git(&repo.path, &["stash", "push", "-m", "libre-sync pull"])
+        let stash_out = git_write(&repo.path, &["stash", "push", "-m", "libre-sync pull"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !stash_out.status.success() {
+            let stderr = String::from_utf8_lossy(&stash_out.stderr)
+                .trim()
+                .to_string();
+            let hint = if stderr.contains("could not write index") {
+                "\n\nLe fichier .git/index.lock reste bloque apres plusieurs essais -- ferme l'IDE ou les autres outils git ouverts sur ce depot, puis reessaie."
+            } else {
+                ""
+            };
             return Err(format!(
-                "git stash a echoue -- mise a jour annulee:\n{}",
-                String::from_utf8_lossy(&stash_out.stderr).trim()
+                "git stash a echoue -- mise a jour annulee:\n{stderr}{hint}"
             ));
         }
     }
 
-    let pull_out = git(&repo.path, &["pull", "--ff-only"]);
+    let pull_out = git_write(&repo.path, &["pull", "--ff-only"]);
     let pull_msg = match pull_out {
         Some(out) if out.status.success() => {
             let msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -659,20 +694,20 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
             }
         }
         Some(out) => {
-            let _ = git(&repo.path, &["stash", "pop"]);
+            let _ = git_write(&repo.path, &["stash", "pop"]);
             return Err(format!(
                 "git pull a echoue (stash restaure) -- {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
         None => {
-            let _ = git(&repo.path, &["stash", "pop"]);
+            let _ = git_write(&repo.path, &["stash", "pop"]);
             return Err("Impossible de lancer git.".to_string());
         }
     };
 
     if needs_stash {
-        let pop_out = git(&repo.path, &["stash", "pop"])
+        let pop_out = git_write(&repo.path, &["stash", "pop"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !pop_out.status.success() {
             return Err(format!(

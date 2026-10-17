@@ -144,7 +144,11 @@ fn git_write(path: &str, args: &[&str]) -> Option<Output> {
         let failed_on_lock = match &last {
             Some(out) => {
                 !out.status.success()
-                    && String::from_utf8_lossy(&out.stderr).contains("could not write index")
+                    && {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        stderr.contains("could not write index")
+                            || stderr.contains("index.lock")
+                    }
             }
             None => false,
         };
@@ -365,6 +369,15 @@ fn gh_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Default local path for a newly discovered repo: joins the base dir
+/// and the repo name with exactly one separator, whether or not the
+/// configured base already ends with one (`"W:/"`, `"W:"`, `"~/hub/"`
+/// must all produce a valid path, never `"W:repo"`).
+fn default_repo_path(base_dir: &str, name: &str) -> String {
+    let base = base_dir.trim_end_matches(['/', '\\']);
+    format!("{base}/{name}")
+}
+
 /// Appends any repo that exists on GitHub but isn't in the config yet,
 /// with a default path under `defaultBaseDir`. Never touches or
 /// relocates an existing entry's path.
@@ -411,10 +424,19 @@ fn sync_from_github(cfg: &mut HubConfig) {
         if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
             continue;
         }
+        let default_path = default_repo_path(&cfg.default_base_dir, name);
+        // Two entries pointing at the same local clone (a custom path
+        // that happens to match the generated default) would make every
+        // status check and pull act twice on one worktree -- skip the
+        // addition instead; the user can add it by hand with its own
+        // path if it's genuinely a different clone.
+        if cfg.repos.iter().any(|r| r.path == default_path) {
+            continue;
+        }
         cfg.repos.push(RepoConfig {
             name: name.to_string(),
             owner: owner.to_string(),
-            path: format!("{}{}", cfg.default_base_dir, name),
+            path: default_path,
         });
     }
 }
@@ -429,26 +451,30 @@ pub fn list_repo_status(app: AppHandle) -> Result<Vec<RepoStatus>, String> {
     }
 
     // Each check is a handful of short-lived git subprocesses plus one
-    // network fetch -- worth parallelizing once there's a dozen+ repos.
-    let handles: Vec<_> = cfg
-        .repos
-        .iter()
-        .cloned()
-        .map(|repo| std::thread::spawn(move || check_repo(&repo)))
-        .collect();
-
-    let mut statuses: Vec<RepoStatus> = Vec::with_capacity(handles.len());
-    for (handle, repo) in handles.into_iter().zip(cfg.repos.iter()) {
-        match handle.join() {
-            Ok(status) => statuses.push(status),
-            Err(_) => statuses.push(RepoStatus {
-                name: repo.name.clone(),
-                owner: repo.owner.clone(),
-                path: repo.path.clone(),
-                state: "erreur".to_string(),
-                detail: "verification interrompue (thread panique)".to_string(),
-                dirty: false,
-            }),
+    // network fetch -- worth parallelizing once there's a dozen+ repos,
+    // but bounded: `gh repo list --limit 1000` can add hundreds of
+    // entries and one thread (plus one network fetch) each would open
+    // that many concurrent connections at once.
+    const MAX_CONCURRENT_CHECKS: usize = 8;
+    let mut statuses: Vec<RepoStatus> = Vec::with_capacity(cfg.repos.len());
+    for chunk in cfg.repos.chunks(MAX_CONCURRENT_CHECKS) {
+        let handles: Vec<_> = chunk
+            .iter()
+            .cloned()
+            .map(|repo| std::thread::spawn(move || check_repo(&repo)))
+            .collect();
+        for (handle, repo) in handles.into_iter().zip(chunk.iter()) {
+            match handle.join() {
+                Ok(status) => statuses.push(status),
+                Err(_) => statuses.push(RepoStatus {
+                    name: repo.name.clone(),
+                    owner: repo.owner.clone(),
+                    path: repo.path.clone(),
+                    state: "erreur".to_string(),
+                    detail: "verification interrompue (thread panique)".to_string(),
+                    dirty: false,
+                }),
+            }
         }
     }
     Ok(statuses)
@@ -516,7 +542,7 @@ pub fn update_repo_path(
     if cfg
         .repos
         .iter()
-        .any(|r| r.name != name && r.owner == owner && r.path == path)
+        .any(|r| !(r.name == name && r.owner == owner) && r.path == path)
     {
         return Err(format!(
             "Le chemin {path} est deja utilise par un autre depot."
@@ -1118,6 +1144,14 @@ serde = { version = "1", features = ["derive"] }
         let (state, detail) = classify_state(Some("abc"), None, 0, 0);
         assert_eq!(state, "erreur");
         assert_eq!(detail, "pas de branche amont configuree");
+    }
+
+    #[test]
+    fn default_repo_path_handles_base_dir_with_or_without_separator() {
+        assert_eq!(default_repo_path("W:/", "repo"), "W:/repo");
+        assert_eq!(default_repo_path("W:", "repo"), "W:/repo");
+        assert_eq!(default_repo_path("~/hub/", "repo"), "~/hub/repo");
+        assert_eq!(default_repo_path("~/hub", "repo"), "~/hub/repo");
     }
 
     #[test]

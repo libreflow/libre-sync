@@ -63,6 +63,10 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // True only while the clone/pull batch loop is running -- the cancel
+  // button is shown on this, not on `busy`, because a single-repo
+  // update (packages, Vite/Tauri, stash-pull) has no loop to interrupt.
+  const [batchRunning, setBatchRunning] = useState(false);
   const [inFlight, setInFlight] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   // Synchronous guard: `busy` (React state) only reflects on the next
@@ -134,6 +138,7 @@ function App() {
     busyRef.current = true;
     cancelRef.current = false;
     setBusy(true);
+    setBatchRunning(true);
     let ok = 0;
     let failed = 0;
     let skipped = 0;
@@ -180,6 +185,7 @@ function App() {
     setInFlight(null);
     busyRef.current = false;
     setBusy(false);
+    setBatchRunning(false);
     setSelected(new Set());
     const parts = [`${ok} reussi(s)`, `${failed} echec(s)`, `${skipped} ignore(s)`];
     if (cancelled) parts.push("annule apres le depot en cours");
@@ -422,7 +428,10 @@ function App() {
               <div
                 key={repoId(repo)}
                 className={`repo-row${activeName === repoId(repo) ? " active" : ""}`}
-                onClick={() => setActiveName(repoId(repo))}
+                onClick={() => {
+                  setActiveName(repoId(repo));
+                  setConfirmRemove(false);
+                }}
               >
                 <input
                   type="checkbox"
@@ -449,7 +458,7 @@ function App() {
           >
             {primaryLabel}
           </button>
-          {busy && (
+          {batchRunning && (
             <button className="full-width cancel-btn" onClick={cancelBatch}>
               Annuler
             </button>

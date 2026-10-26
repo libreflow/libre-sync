@@ -107,10 +107,16 @@ function App() {
     refresh();
   }, [refresh]);
 
-  const filteredRepos = useMemo(
-    () => repos.filter((r) => r.name.toLowerCase().includes(filter.toLowerCase())),
-    [repos, filter],
-  );
+  const filteredRepos = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return repos;
+    // Match "owner/name" queries too, not just the name -- two
+    // owners can have same-named repos and the name alone doesn't
+    // disambiguate.
+    return repos.filter(
+      (r) => r.name.toLowerCase().includes(q) || `${r.owner}/${r.name}`.toLowerCase().includes(q),
+    );
+  }, [repos, filter]);
 
   const actionableRepos = repos.filter((r) => ACTIONABLE.includes(r.state));
   // Select-all operates on what the filter actually shows: selecting

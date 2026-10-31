@@ -500,6 +500,12 @@ pub fn add_repo(
     if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
         return Err(format!("{owner}/{name} est deja dans la configuration."));
     }
+    // Same guard as update_repo_path/sync_from_github: two entries on
+    // one clone would double every status check and pull on a single
+    // worktree.
+    if cfg.repos.iter().any(|r| r.path == path) {
+        return Err(format!("Le chemin {path} est deja utilise par un autre depot."));
+    }
     cfg.repos.push(RepoConfig {
         name: name.to_string(),
         owner: owner.to_string(),
@@ -691,7 +697,17 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
         .trim()
         .is_empty();
 
-    if needs_stash {
+    // Locale-proof way to know whether `stash push` actually created
+    // an entry: compare the stash list before and after. The tree can
+    // become clean between the status check and the push (an IDE
+    // reverting/committing in the background), and popping a stash
+    // that was never created would apply -- and drop -- an unrelated
+    // older entry.
+    let stash_created = if needs_stash {
+        let before = git_capture(&repo.path, &["stash", "list"])
+            .unwrap_or_default()
+            .lines()
+            .count();
         let stash_out = git_write(&repo.path, &["stash", "push", "-m", "libre-sync pull"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !stash_out.status.success() {
@@ -707,7 +723,14 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
                 "git stash a echoue -- mise a jour annulee:\n{stderr}{hint}"
             ));
         }
-    }
+        let after = git_capture(&repo.path, &["stash", "list"])
+            .unwrap_or_default()
+            .lines()
+            .count();
+        after > before
+    } else {
+        false
+    };
 
     let pull_out = git_write(&repo.path, &["pull", "--ff-only"]);
     let pull_msg = match pull_out {
@@ -720,19 +743,23 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
             }
         }
         Some(out) => {
-            let _ = git_write(&repo.path, &["stash", "pop"]);
+            if stash_created {
+                let _ = git_write(&repo.path, &["stash", "pop"]);
+            }
             return Err(format!(
                 "git pull a echoue (stash restaure) -- {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
         None => {
-            let _ = git_write(&repo.path, &["stash", "pop"]);
+            if stash_created {
+                let _ = git_write(&repo.path, &["stash", "pop"]);
+            }
             return Err("Impossible de lancer git.".to_string());
         }
     };
 
-    if needs_stash {
+    if stash_created {
         let pop_out = git_write(&repo.path, &["stash", "pop"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !pop_out.status.success() {
@@ -743,7 +770,7 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
         }
     }
 
-    Ok(if needs_stash {
+    Ok(if stash_created {
         format!("{pull_msg}\n(modifications locales mises de cote puis restaurees)")
     } else {
         pull_msg

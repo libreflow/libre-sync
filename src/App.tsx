@@ -73,6 +73,7 @@ function App() {
   // render, so a double-click before that re-render would start a
   // second concurrent clone/pull loop. This ref flips in the same tick.
   const busyRef = useRef(false);
+  const refreshingRef = useRef(false);
   // Cancellation is checked between repos of a batch: the in-flight
   // subprocess (a clone can run for minutes) is left to finish, then
   // the loop stops.
@@ -89,6 +90,12 @@ function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    // Same synchronous guard as the action runners: `loading` state
+    // only reflects on the next render, so a double-click on the
+    // refresh button would start two concurrent list_repo_status
+    // calls (each spawning git subprocesses on every repo).
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
     setLoading(true);
     setLoadError(null);
     try {
@@ -100,6 +107,7 @@ function App() {
       appendLog(`Erreur de chargement : ${String(e)}`);
     } finally {
       setLoading(false);
+      refreshingRef.current = false;
     }
   }, [appendLog]);
 
@@ -138,7 +146,9 @@ function App() {
     busyRef.current = true;
     cancelRef.current = false;
     setBusy(true);
-    setBatchRunning(true);
+    // A single-target run has no loop to interrupt: showing the cancel
+    // button there would log a promise it cannot keep.
+    setBatchRunning(targets.length > 1);
     let ok = 0;
     let failed = 0;
     let skipped = 0;
@@ -320,13 +330,6 @@ function App() {
   // work (an all-selected list of up-to-date repos still runs -- pull
   // is idempotent and answers 'deja a jour').
   const primaryTargets = selectedRepos.length > 0 ? selectedRepos : actionableRepos;
-  const primaryLabel = busy
-    ? "En cours..."
-    : selectedRepos.length > 0
-      ? `Cloner / mettre a jour la selection (${selectedRepos.length})`
-      : actionableRepos.length > 0
-        ? `Tout cloner / mettre a jour (${actionableRepos.length})`
-        : "Tout est a jour";
 
   const summary = {
     ok: repos.filter((r) => r.state === "a-jour").length,
@@ -334,6 +337,16 @@ function App() {
     missing: repos.filter((r) => r.state === "non-clone").length,
     warn: repos.filter((r) => r.state === "divergent" || r.state === "erreur").length,
   };
+
+  const primaryLabel = busy
+    ? "En cours..."
+    : selectedRepos.length > 0
+      ? `Cloner / mettre a jour la selection (${selectedRepos.length})`
+      : actionableRepos.length > 0
+        ? `Tout cloner / mettre a jour (${actionableRepos.length})`
+        : summary.warn > 0
+          ? `Rien a cloner / mettre a jour (${summary.warn} a verifier)`
+          : "Tout est a jour";
 
   return (
     <div className="shell">

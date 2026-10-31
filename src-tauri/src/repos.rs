@@ -367,6 +367,157 @@ fn gh_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Login of the authenticated GitHub account, via `gh api user` -- the
+/// only reliable, locale-proof way to know gh is actually logged in
+/// (`gh auth status` output is localized and its exit code is 0 even
+/// when only an unauthenticated gh is installed). `Ok(None)` means
+/// "gh missing or not logged in": the UI shows the connect banner.
+#[tauri::command]
+pub fn gh_auth_status() -> Result<Option<String>, String> {
+    if !gh_available() {
+        return Ok(None);
+    }
+    let Some(out) = run("gh", &["api", "user", "--jq", ".login"]) else {
+        return Ok(None);
+    };
+    if out.status.success() {
+        Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+
+/// OAuth Device Flow (https://docs.github.com/en/apps/creating-oauth-apps)
+/// -- designed for desktop apps: no redirect URL, no local server.
+/// Step 1: ask GitHub for a device+user code; the user opens the
+/// verification URI and types the code while we poll for the token.
+/// `client_id` is the public OAuth app id -- the secret is not used
+/// in this flow, safe to embed in a desktop app.
+#[tauri::command]
+pub fn github_device_code(client_id: String) -> Result<GithubDeviceCode, String> {
+    let resp = reqwest::blocking::Client::new()
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .form(&[("client_id", client_id.as_str())])
+        .send()
+        .map_err(|e| format!("Requete GitHub impossible: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub a refuse la demande: {}", resp.status()));
+    }
+    let json: GithubDeviceCode = resp
+        .json()
+        .map_err(|e| format!("Reponse GitHub invalide: {e}"))?;
+    Ok(json)
+}
+
+/// Step 2: poll GitHub for the token. Returns `Ok(None)` while the
+/// user hasn't confirmed yet (`authorization_pending`), `Ok(Some(token))`
+/// once they have. `Err` on hard errors (expired code, wrong client).
+#[tauri::command]
+pub fn github_device_poll(
+    client_id: String,
+    device_code: String,
+) -> Result<Option<String>, String> {
+    let resp = reqwest::blocking::Client::new()
+        .post("https://github.com/repos/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("device_code", device_code.as_str()),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ])
+        .send()
+        .map_err(|e| format!("Requete GitHub impossible: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub a refuse la demande: {}", resp.status()));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("Reponse GitHub invalide: {e}"))?;
+    if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+        return match err {
+            "authorization_pending" | "slow_down" => Ok(None),
+            "expired_token" => Err("Code expire -- relance la connexion.".to_string()),
+            "unsupported_grant_type" => Err("Flux non autorise pour cette OAuth App.".to_string()),
+            other => Err(format!("GitHub: {other}")),
+        };
+    }
+    Ok(json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+/// Step 3: hand the fresh token to `gh auth login` so every existing
+/// gh-based code path (repo discovery, clones) works unchanged and the
+/// token lives in gh's own secure storage, never in our config file.
+/// The token is passed via stdin, never as a command-line argument
+/// (visible in process lists) and never logged.
+#[tauri::command]
+pub fn gh_login_with_token() -> Result<(), String> {
+    use std::io::Write;
+    if !gh_available() {
+        return Err("gh CLI introuvable -- installe GitHub CLI pour connecter ton compte.".to_string());
+    }
+    let mut child = std::process::Command::new("gh")
+        .args(["auth", "login", "--with-token"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Impossible de lancer gh: {e}"))?;
+    // Token is expected on stdin of the spawned gh process; the pipe
+    // write happens here, in-process, and is never stored anywhere.
+    let mut token = GITHUB_TOKEN.lock().map_err(|_| "Verrou interne.".to_string())?;
+    if token.is_empty() {
+        return Err("Aucun token a transmettre -- relance la connexion.".to_string());
+    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Impossible d'ecrire le token vers gh.".to_string())?;
+    stdin
+        .write_all(token.as_bytes())
+        .map_err(|e| format!("Transmission du token impossible: {e}"))?;
+    drop(stdin);
+    token.clear();
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("gh auth login a echoue: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// In-memory only: the token transits from the poll to gh's stdin and
+/// is never persisted to disk by this app.
+static GITHUB_TOKEN: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Stores the token returned by `github_device_poll` in the in-memory
+/// slot `gh_login_with_token` reads from, then wipes the copy the
+/// frontend could have echoed into a log.
+#[tauri::command]
+pub fn github_store_token(token: String) {
+    if let Ok(mut slot) = GITHUB_TOKEN.lock() {
+        *slot = token;
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubDeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
 /// Default local path for a newly discovered repo: joins the base dir
 /// and the repo name with exactly one separator, whether or not the
 /// configured base already ends with one (`"W:/"`, `"W:"`, `"~/hub/"`
@@ -507,6 +658,12 @@ pub async fn add_repo(
     let mut cfg = load_config(&app)?;
     if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
         return Err(format!("{owner}/{name} est deja dans la configuration."));
+    }
+    // Same guard as update_repo_path/sync_from_github: two entries on
+    // one clone would double every status check and pull on a single
+    // worktree.
+    if cfg.repos.iter().any(|r| r.path == path) {
+        return Err(format!("Le chemin {path} est deja utilise par un autre depot."));
     }
     cfg.repos.push(RepoConfig {
         name: name.to_string(),
@@ -711,7 +868,17 @@ pub async fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Res
         .trim()
         .is_empty();
 
-    if needs_stash {
+    // Locale-proof way to know whether `stash push` actually created
+    // an entry: compare the stash list before and after. The tree can
+    // become clean between the status check and the push (an IDE
+    // reverting/committing in the background), and popping a stash
+    // that was never created would apply -- and drop -- an unrelated
+    // older entry.
+    let stash_created = if needs_stash {
+        let before = git_capture(&repo.path, &["stash", "list"])
+            .unwrap_or_default()
+            .lines()
+            .count();
         let stash_out = git_write(&repo.path, &["stash", "push", "-m", "libre-sync pull"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !stash_out.status.success() {
@@ -727,7 +894,14 @@ pub async fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Res
                 "git stash a echoue -- mise a jour annulee:\n{stderr}{hint}"
             ));
         }
-    }
+        let after = git_capture(&repo.path, &["stash", "list"])
+            .unwrap_or_default()
+            .lines()
+            .count();
+        after > before
+    } else {
+        false
+    };
 
     let pull_out = git_write(&repo.path, &["pull", "--ff-only"]);
     let pull_msg = match pull_out {
@@ -740,19 +914,23 @@ pub async fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Res
             }
         }
         Some(out) => {
-            let _ = git_write(&repo.path, &["stash", "pop"]);
+            if stash_created {
+                let _ = git_write(&repo.path, &["stash", "pop"]);
+            }
             return Err(format!(
                 "git pull a echoue (stash restaure) -- {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
         None => {
-            let _ = git_write(&repo.path, &["stash", "pop"]);
+            if stash_created {
+                let _ = git_write(&repo.path, &["stash", "pop"]);
+            }
             return Err("Impossible de lancer git.".to_string());
         }
     };
 
-    if needs_stash {
+    if stash_created {
         let pop_out = git_write(&repo.path, &["stash", "pop"])
             .ok_or_else(|| "Impossible de lancer git.".to_string())?;
         if !pop_out.status.success() {
@@ -763,7 +941,7 @@ pub async fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Res
         }
     }
 
-    Ok(if needs_stash {
+    Ok(if stash_created {
         format!("{pull_msg}\n(modifications locales mises de cote puis restaurees)")
     } else {
         pull_msg

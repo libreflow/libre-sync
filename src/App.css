@@ -336,6 +336,56 @@ button.primary:hover:not(:disabled) {
   color: #f85149;
 }
 
+/* ---------- GitHub connection banner ---------- */
+
+.gh-banner {
+  background: #1c1e23;
+  border: 1px solid #2a2c33;
+  border-radius: 8px;
+  margin: 0 16px 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gh-banner-text {
+  color: #c6c9d1;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.gh-banner-ok {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: #c6c9d1;
+  font-size: 0.82rem;
+}
+
+.gh-banner-error {
+  color: #f85149;
+  font-size: 0.8rem;
+}
+
+.gh-banner-actions button {
+  align-self: flex-start;
+}
+
+.gh-device-code {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: #c6c9d1;
+  flex-wrap: wrap;
+}
+
+.gh-device-code strong {
+  font-family: "Cascadia Code", Consolas, monospace;
+  letter-spacing: 0.05em;
+}
+
 /* ---------- Add-repo form ---------- */
 
 .add-form {

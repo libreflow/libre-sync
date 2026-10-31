@@ -15,6 +15,11 @@ pub fn run() {
             repos::update_packages,
             repos::update_framework,
             repos::open_in_explorer,
+            repos::gh_auth_status,
+            repos::github_device_code,
+            repos::github_device_poll,
+            repos::github_store_token,
+            repos::gh_login_with_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

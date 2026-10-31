@@ -137,9 +137,9 @@ fn clean_progress_output(raw: &str) -> String {
 /// Observed in practice as a burst of instant stash failures. Retry a
 /// few times with growing delay; other errors are returned as-is.
 fn git_write(path: &str, args: &[&str]) -> Option<Output> {
-    const delays: [u64; 3] = [150, 500, 1000];
+    const RETRY_DELAYS_MS: [u64; 3] = [150, 500, 1000];
     let mut last = git(path, args);
-    for delay in delays {
+    for delay in RETRY_DELAYS_MS {
         let failed_on_lock = match &last {
             Some(out) => {
                 !out.status.success()

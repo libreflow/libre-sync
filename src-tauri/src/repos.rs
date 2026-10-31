@@ -510,7 +510,7 @@ pub fn github_store_token(token: String) {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GithubDeviceCode {
     pub device_code: String,

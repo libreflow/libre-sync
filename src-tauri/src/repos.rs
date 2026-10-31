@@ -137,10 +137,9 @@ fn clean_progress_output(raw: &str) -> String {
 /// Observed in practice as a burst of instant stash failures. Retry a
 /// few times with growing delay; other errors are returned as-is.
 fn git_write(path: &str, args: &[&str]) -> Option<Output> {
-    const LOCK_RETRIES: usize = 3;
-    let delays = [150, 500, 1000];
+    const RETRY_DELAYS_MS: [u64; 3] = [150, 500, 1000];
     let mut last = git(path, args);
-    for (attempt, delay) in (0..LOCK_RETRIES).zip(delays) {
+    for delay in RETRY_DELAYS_MS {
         let failed_on_lock = match &last {
             Some(out) => {
                 !out.status.success()
@@ -157,7 +156,6 @@ fn git_write(path: &str, args: &[&str]) -> Option<Output> {
         }
         std::thread::sleep(Duration::from_millis(delay));
         last = git(path, args);
-        let _ = attempt;
     }
     last
 }
@@ -533,6 +531,11 @@ fn default_repo_path(base_dir: &str, name: &str) -> String {
 /// with a default path under `defaultBaseDir`. Never touches or
 /// relocates an existing entry's path.
 fn sync_from_github(cfg: &mut HubConfig) {
+    if cfg.default_base_dir.trim().is_empty() {
+        // An empty base dir would make default_repo_path produce an
+        // absolute "/name" -- a repo silently pointed at the disk root.
+        return;
+    }
     if !gh_available() {
         return;
     }
@@ -592,8 +595,13 @@ fn sync_from_github(cfg: &mut HubConfig) {
     }
 }
 
+/// Async on purpose: Tauri runs synchronous commands on the main
+/// thread, so a long one freezes the whole window (no spinner, no
+/// repaint) until it returns. Every command below does network I/O
+/// (fetch, clone, gh) or minutes-long package updates; marking them
+/// async moves them off the main thread onto the async runtime.
 #[tauri::command]
-pub fn list_repo_status(app: AppHandle) -> Result<Vec<RepoStatus>, String> {
+pub async fn list_repo_status(app: AppHandle) -> Result<Vec<RepoStatus>, String> {
     let mut cfg = load_config(&app)?;
     let before = cfg.repos.len();
     sync_from_github(&mut cfg);
@@ -635,7 +643,7 @@ pub fn list_repo_status(app: AppHandle) -> Result<Vec<RepoStatus>, String> {
 /// same (name, owner) pair -- so a manual add can never create the
 /// duplicate sync_from_github's dedup guards against.
 #[tauri::command]
-pub fn add_repo(
+pub async fn add_repo(
     app: AppHandle,
     name: String,
     owner: String,
@@ -669,7 +677,7 @@ pub fn add_repo(
 /// Remove a repo from the config. Never touches the clone on disk --
 /// removing an entry must not look like it deletes the working copy.
 #[tauri::command]
-pub fn remove_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+pub async fn remove_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let mut cfg = load_config(&app)?;
     let before = cfg.repos.len();
     cfg.repos.retain(|r| !(r.name == name && r.owner == owner));
@@ -685,7 +693,7 @@ pub fn remove_repo(app: AppHandle, name: String, owner: String) -> Result<String
 /// Edit a repo's local path -- the "I moved my clone" case. Rejects a
 /// path that would collide with another entry's path.
 #[tauri::command]
-pub fn update_repo_path(
+pub async fn update_repo_path(
     app: AppHandle,
     name: String,
     owner: String,
@@ -719,7 +727,7 @@ pub fn update_repo_path(
 }
 
 #[tauri::command]
-pub fn clone_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+pub async fn clone_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
@@ -729,6 +737,10 @@ pub fn clone_repo(app: AppHandle, name: String, owner: String) -> Result<String,
 
     if Path::new(&repo.path).join(".git").exists() {
         return Err("Ce depot est deja clone.".to_string());
+    }
+
+    if Path::new(&repo.path).exists() {
+        return Err("Le chemin existe deja -- clone annule pour ne rien ecraser.".to_string());
     }
 
     if let Some(parent) = Path::new(&repo.path).parent() {
@@ -755,12 +767,20 @@ pub fn clone_repo(app: AppHandle, name: String, owner: String) -> Result<String,
     if output.status.success() {
         Ok(format!("clone avec succes dans {}", repo.path))
     } else {
+        // A clone that dies mid-transfer leaves a half-written repo
+        // with a .git dir behind: the next status check would then
+        // think the repo is cloned and every action would fail with
+        // cryptic git errors. Remove the folder this clone just
+        // created (the exists() guard above guarantees we only ever
+        // delete something we made) so the repo stays honestly
+        // "non-clone".
+        let _ = std::fs::remove_dir_all(&repo.path);
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
 #[tauri::command]
-pub fn pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+pub async fn pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
@@ -816,7 +836,7 @@ pub fn pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, 
 /// conflicts, the stash entry is kept -- the user resolves by hand and
 /// no work is silently dropped.
 #[tauri::command]
-pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+pub async fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
@@ -936,7 +956,7 @@ pub fn stash_pull_repo(app: AppHandle, name: String, owner: String) -> Result<St
 /// resulting lockfile changes uncommitted in the working tree, same as
 /// any other local edit -- this command never commits or pushes.
 #[tauri::command]
-pub fn update_packages(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+pub async fn update_packages(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos
@@ -1063,7 +1083,7 @@ fn find_tauri_crate_deps(cargo_toml: &str) -> Vec<(String, bool)> {
 /// `update_packages`: this never commits or pushes, the user reviews
 /// and tests before committing.
 #[tauri::command]
-pub fn update_framework(app: AppHandle, name: String, owner: String) -> Result<String, String> {
+pub async fn update_framework(app: AppHandle, name: String, owner: String) -> Result<String, String> {
     let cfg = load_config(&app)?;
     let repo = cfg
         .repos

@@ -668,9 +668,7 @@ pub async fn github_device_code(client_id: String) -> Result<GithubDeviceCode, S
             .map_err(|e| format!("Reponse GitHub invalide ({status}): {e}"))?;
         if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
             return Err(match err {
-                "unsupported_grant_type" => {
-                    "Flux non autorise pour cette OAuth App.".to_string()
-                }
+                "unsupported_grant_type" => "Flux non autorise pour cette OAuth App.".to_string(),
                 "unauthorized_client" => "Client ID OAuth inconnu de GitHub.".to_string(),
                 other => format!("GitHub: {other}"),
             });
@@ -772,6 +770,14 @@ pub async fn gh_login_with_token() -> Result<(), String> {
     }
 }
 
+/// GitHub names are case-insensitively unique and Windows paths match
+/// case-insensitively across separators: normalize before comparing,
+/// or "Libre-Piano" vs "libre-piano" or "W:\X" vs "W:/x" look distinct
+/// and duplicate entries slip past the dedup guards.
+fn normalized(s: &str) -> String {
+    s.to_lowercase().replace('\\', "/")
+}
+
 /// Default local path for a newly discovered repo: joins the base dir
 /// and the repo name with exactly one separator, whether or not the
 /// configured base already ends with one (`"W:/"`, `"W:"`, `"~/hub/"`
@@ -802,8 +808,10 @@ fn sync_from_github(cfg: &mut HubConfig) {
             "--limit",
             "1000",
             "--json",
-            "name",
-            "owner",
+            // One comma-separated value: two separate args make gh
+            // fail with "accepts at most 1 arg(s), received 2" and
+            // discovery silently adds nothing.
+            "name,owner",
         ],
     ) else {
         return;
@@ -829,7 +837,11 @@ fn sync_from_github(cfg: &mut HubConfig) {
         // Compare on the (name, owner) pair, not the name alone: two
         // different accounts can own same-named repos, and a name-only
         // match would silently skip a genuinely new (or forked) repo.
-        if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
+        if cfg
+            .repos
+            .iter()
+            .any(|r| r.name.eq_ignore_ascii_case(name) && r.owner.eq_ignore_ascii_case(owner))
+        {
             continue;
         }
         let default_path = default_repo_path(&cfg.default_base_dir, name);
@@ -838,7 +850,11 @@ fn sync_from_github(cfg: &mut HubConfig) {
         // status check and pull act twice on one worktree -- skip the
         // addition instead; the user can add it by hand with its own
         // path if it's genuinely a different clone.
-        if cfg.repos.iter().any(|r| r.path == default_path) {
+        if cfg
+            .repos
+            .iter()
+            .any(|r| normalized(&r.path) == normalized(&default_path))
+        {
             continue;
         }
         cfg.repos.push(RepoConfig {
@@ -910,14 +926,24 @@ pub async fn add_repo(
         return Err("Nom, owner et chemin sont obligatoires.".to_string());
     }
     let mut cfg = load_config(&app)?;
-    if cfg.repos.iter().any(|r| r.name == name && r.owner == owner) {
+    if cfg
+        .repos
+        .iter()
+        .any(|r| r.name.eq_ignore_ascii_case(name) && r.owner.eq_ignore_ascii_case(owner))
+    {
         return Err(format!("{owner}/{name} est deja dans la configuration."));
     }
     // Same guard as update_repo_path/sync_from_github: two entries on
     // one clone would double every status check and pull on a single
     // worktree.
-    if cfg.repos.iter().any(|r| r.path == path) {
-        return Err(format!("Le chemin {path} est deja utilise par un autre depot."));
+    if cfg
+        .repos
+        .iter()
+        .any(|r| normalized(&r.path) == normalized(path))
+    {
+        return Err(format!(
+            "Le chemin {path} est deja utilise par un autre depot."
+        ));
     }
     cfg.repos.push(RepoConfig {
         name: name.to_string(),
@@ -958,11 +984,11 @@ pub async fn update_repo_path(
         return Err("Le chemin est obligatoire.".to_string());
     }
     let mut cfg = load_config(&app)?;
-    if cfg
-        .repos
-        .iter()
-        .any(|r| !(r.name == name && r.owner == owner) && r.path == path)
-    {
+    if cfg.repos.iter().any(|r| {
+        !(r.name.eq_ignore_ascii_case(name.as_str())
+            && r.owner.eq_ignore_ascii_case(owner.as_str()))
+            && normalized(&r.path) == normalized(path)
+    }) {
         return Err(format!(
             "Le chemin {path} est deja utilise par un autre depot."
         ));
@@ -1636,6 +1662,12 @@ serde = { version = "1", features = ["derive"] }
         assert!(map_device_flow_error("expired_token").is_err());
         assert!(map_device_flow_error("unsupported_grant_type").is_err());
         assert!(map_device_flow_error("incorrect_device_code").is_err());
+    }
+
+    #[test]
+    fn normalized_collapses_case_and_separators() {
+        assert_eq!(normalized("W:\\Libre-Piano"), normalized("w:/libre-piano"));
+        assert_eq!(normalized("Libre-Piano"), normalized("libre-piano"));
     }
 
     #[test]

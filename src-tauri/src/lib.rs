@@ -19,6 +19,9 @@ pub fn run() {
             repos::gh_connect_begin,
             repos::gh_connect_finish,
             repos::gh_connect_cancel,
+            repos::github_device_code,
+            repos::github_device_poll,
+            repos::gh_login_with_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

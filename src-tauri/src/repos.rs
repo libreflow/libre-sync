@@ -582,6 +582,196 @@ pub async fn gh_connect_cancel() {
     }
 }
 
+/// In-memory slot between the OAuth App Device Flow poll and
+/// "gh auth login --with-token": the token never crosses the IPC
+/// boundary to the webview and is never written to disk by this app --
+/// its permanent home is gh's own secure credential storage.
+static GITHUB_TOKEN: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubDeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// Outcome of a Device Flow poll: Pending (user hasn't confirmed yet),
+/// SlowDown (GitHub asks to slow the polling -- spec: +5 s on the
+/// interval, applied by the caller) or Authorized (token received and
+/// stored, ready for gh_login_with_token).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GithubDevicePoll {
+    Pending,
+    SlowDown,
+    Authorized,
+}
+
+/// Maps a GitHub Device Flow "error" value to the poll outcome or the
+/// user-facing message; kept separate from the HTTP plumbing so it can
+/// be unit tested without a network.
+fn map_device_flow_error(err: &str) -> Result<GithubDevicePoll, String> {
+    match err {
+        "authorization_pending" => Ok(GithubDevicePoll::Pending),
+        "slow_down" => Ok(GithubDevicePoll::SlowDown),
+        "expired_token" => Err("Code expire -- relance la connexion.".to_string()),
+        "unsupported_grant_type" => Err("Flux non autorise pour cette OAuth App.".to_string()),
+        other => Err(format!("GitHub: {other}")),
+    }
+}
+
+/// Runs a blocking closure on its own thread and gives up after
+/// "timeout". reqwest::blocking panics when driven from inside an
+/// async runtime, so the HTTP calls cannot run on the command's own
+/// (tokio) thread -- a plain std thread has no runtime.
+fn blocking_on_thread<T, F>(timeout: Duration, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(res) => res,
+        // Timeout or a panicked closure: no answer came either way.
+        Err(_) => Err("Delai depasse (reseau GitHub injoignable ?).".to_string()),
+    }
+}
+
+/// Methode 1, etape 1 : demander a GitHub un code device pour l'OAuth
+/// App LibreSync (https://docs.github.com/en/apps/creating-oauth-apps).
+/// Le client_id est public par design dans ce flux : aucun secret
+/// n'intervient et l'ID seul ne peut rien accorder -- c'est
+/// l'utilisateur qui autorise chaque connexion sur github.com. Les
+/// scopes sont ceux du "gh auth login" standard pour que le token
+/// recu soit un remplacement complet des credentials gh.
+#[tauri::command]
+pub async fn github_device_code(client_id: String) -> Result<GithubDeviceCode, String> {
+    blocking_on_thread(Duration::from_secs(30), move || {
+        let resp = reqwest::blocking::Client::new()
+            .post("https://github.com/login/device/code")
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("scope", "repo read:org gist workflow"),
+            ])
+            .send()
+            .map_err(|e| format!("Requete GitHub impossible: {e}"))?;
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("Reponse GitHub invalide ({status}): {e}"))?;
+        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+            return Err(match err {
+                "unsupported_grant_type" => {
+                    "Flux non autorise pour cette OAuth App.".to_string()
+                }
+                "unauthorized_client" => "Client ID OAuth inconnu de GitHub.".to_string(),
+                other => format!("GitHub: {other}"),
+            });
+        }
+        if !status.is_success() {
+            return Err(format!("GitHub a refuse la demande: {status}"));
+        }
+        serde_json::from_value(json).map_err(|e| format!("Reponse GitHub invalide: {e}"))
+    })
+}
+
+/// Methode 1, etape 2 : interroger GitHub pour le token. Le token
+/// n'est jamais renvoye au webview : il reste en memoire (slot
+/// GITHUB_TOKEN) pour gh_login_with_token, son seul destinataire.
+#[tauri::command]
+pub async fn github_device_poll(
+    client_id: String,
+    device_code: String,
+) -> Result<GithubDevicePoll, String> {
+    blocking_on_thread(Duration::from_secs(30), move || {
+        let resp = reqwest::blocking::Client::new()
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("device_code", device_code.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .send()
+            .map_err(|e| format!("Requete GitHub impossible: {e}"))?;
+        let json: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("Reponse GitHub invalide: {e}"))?;
+        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+            return map_device_flow_error(err);
+        }
+        let token = json
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Reponse GitHub sans token.".to_string())?;
+        if let Ok(mut slot) = GITHUB_TOKEN.lock() {
+            *slot = token.to_string();
+        }
+        Ok(GithubDevicePoll::Authorized)
+    })
+}
+
+/// Methode 1, etape 3 : transmettre le token stocke a
+/// "gh auth login --with-token". Le token passe par stdin (jamais en
+/// argument de commande, visible dans les listes de processus, jamais
+/// loggue) et le slot memoire est vide des sa consommation.
+#[tauri::command]
+pub async fn gh_login_with_token() -> Result<(), String> {
+    use std::io::Write;
+    if !gh_available() {
+        return Err(
+            "gh CLI introuvable -- installe GitHub CLI pour terminer la connexion.".to_string(),
+        );
+    }
+    // Vider le slot AVANT de lancer gh : un slot vide doit echouer sans
+    // laisser un process gh attendre son stdin pour toujours.
+    let token = {
+        let mut slot = GITHUB_TOKEN
+            .lock()
+            .map_err(|_| "Verrou interne.".to_string())?;
+        std::mem::take(&mut *slot)
+    };
+    if token.is_empty() {
+        return Err("Aucun token a transmettre -- relance la connexion.".to_string());
+    }
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(["auth", "login", "--hostname", "github.com", "--with-token"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Impossible de lancer gh: {e}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(token.as_bytes()));
+    if let Some(Err(e)) = write_result {
+        let _ = child.kill();
+        return Err(format!("Transmission du token impossible: {e}"));
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("gh auth login a echoue: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Default local path for a newly discovered repo: joins the base dir
 /// and the repo name with exactly one separator, whether or not the
 /// configured base already ends with one (`"W:/"`, `"W:"`, `"~/hub/"`
@@ -1431,6 +1621,21 @@ serde = { version = "1", features = ["derive"] }
             None
         );
         assert_eq!(extract_device_code(""), None);
+    }
+
+    #[test]
+    fn map_device_flow_error_covers_poll_and_hard_errors() {
+        assert!(matches!(
+            map_device_flow_error("authorization_pending"),
+            Ok(GithubDevicePoll::Pending)
+        ));
+        assert!(matches!(
+            map_device_flow_error("slow_down"),
+            Ok(GithubDevicePoll::SlowDown)
+        ));
+        assert!(map_device_flow_error("expired_token").is_err());
+        assert!(map_device_flow_error("unsupported_grant_type").is_err());
+        assert!(map_device_flow_error("incorrect_device_code").is_err());
     }
 
     #[test]

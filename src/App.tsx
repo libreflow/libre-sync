@@ -41,18 +41,9 @@ function repoId(repo: { name: string; owner: string }): string {
 
 const LOG_MAX_ENTRIES = 200;
 
-// Public client_id of LibreSync's GitHub OAuth app. The Device Flow
-// needs no client secret on desktop, so embedding the id is safe and
-// is how the flow is designed.
-const GITHUB_OAUTH_CLIENT_ID = "Ov23liXXXXXXXXXXXXXXXX";
-
-interface GithubDeviceCode {
-  deviceCode: string;
-  userCode: string;
-  verificationUri: string;
-  expiresIn: number;
-  interval: number;
-}
+// Where the user confirms gh's one-time code: gh runs the whole OAuth
+// Device Flow itself, this app only relays the code it prints.
+const GITHUB_DEVICE_URL = "https://github.com/login/device";
 
 interface RepoForm {
   name: string;
@@ -132,10 +123,14 @@ function App() {
   // missing or not logged in, string = login of the connected account.
   const [ghLogin, setGhLogin] = useState<string | null | undefined>(null);
   const [connectBusy, setConnectBusy] = useState(false);
-  const [deviceCode, setDeviceCode] = useState<GithubDeviceCode | null>(null);
+  // One-time code printed by gh while waiting for the user to confirm
+  // on github.com/login/device.
+  const [deviceCode, setDeviceCode] = useState<string | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
-  // Synchronous guard for the poll loop: stops it when the user cancels
-  // or the component unmounts, so no poll outlives the dialog.
+  // Synchronous guards: the React states above only reflect on the
+  // next render, so a double-click would start two gh processes, and
+  // a cancel must stop the flow even mid-await.
+  const connectBusyRef = useRef(false);
   const connectCancelRef = useRef(false);
 
   const checkGhAuth = useCallback(async () => {
@@ -147,57 +142,41 @@ function App() {
     }
   }, []);
 
-  const cancelConnect = useCallback(() => {
+  const cancelConnect = useCallback(async () => {
     connectCancelRef.current = true;
     setConnectBusy(false);
     setDeviceCode(null);
     setConnectError(null);
+    await invoke("gh_connect_cancel").catch(() => {});
   }, []);
 
-  // Device Flow: get the code, show it, poll until the user confirms on
-  // github.com, then hand the token to gh so every existing gh-based
-  // path (discovery, clones) works unchanged.
+  // Connection fully delegated to "gh auth login --web": begin starts
+  // gh and returns its one-time code, finish waits for the user to
+  // confirm on github.com/login/device. No token and no client id
+  // cross the IPC boundary -- gh owns the whole OAuth flow and its
+  // secure storage.
   const connectGithub = useCallback(async () => {
-    if (connectBusy) return;
+    if (connectBusyRef.current) return;
+    connectBusyRef.current = true;
     connectCancelRef.current = false;
     setConnectBusy(true);
     setConnectError(null);
     try {
-      const code = await invoke<GithubDeviceCode>("github_device_code", {
-        clientId: GITHUB_OAUTH_CLIENT_ID,
-      });
+      const code = await invoke<string>("gh_connect_begin");
       setDeviceCode(code);
-      const deadline = Date.now() + code.expiresIn * 1000;
-      const delay = Math.max(code.interval, 5) * 1000;
-      while (Date.now() < deadline && !connectCancelRef.current) {
-        await new Promise((r) => setTimeout(r, delay));
-        if (connectCancelRef.current) return;
-        const token = await invoke<string | null>("github_device_poll", {
-          clientId: GITHUB_OAUTH_CLIENT_ID,
-          deviceCode: code.deviceCode,
-        });
-        if (token) {
-          await invoke("github_store_token", { token });
-          await invoke("gh_login_with_token");
-          setDeviceCode(null);
-          appendLog(`Compte GitHub connecte via gh.`);
-          await checkGhAuth();
-          await refresh();
-          setConnectBusy(false);
-          return;
-        }
-      }
-      if (!connectCancelRef.current) {
-        setConnectError("Delai depasse -- relance la connexion.");
-        setDeviceCode(null);
-      }
-    } catch (e) {
-      setConnectError(String(e));
+      const login = await invoke<string>("gh_connect_finish");
       setDeviceCode(null);
+      appendLog(`Compte GitHub connecte : ${login}.`);
+      await checkGhAuth();
+      await refresh();
+    } catch (e) {
+      setDeviceCode(null);
+      if (!connectCancelRef.current) setConnectError(String(e));
     } finally {
+      connectBusyRef.current = false;
       if (!connectCancelRef.current) setConnectBusy(false);
     }
-  }, [appendLog, checkGhAuth, connectBusy, refresh]);
+  }, [appendLog, checkGhAuth, refresh]);
 
   useEffect(() => {
     checkGhAuth();
@@ -517,9 +496,9 @@ function App() {
             {deviceCode ? (
               <div className="gh-device-code">
                 <div>
-                  Code : <strong>{deviceCode.userCode}</strong>
+                  Code : <strong>{deviceCode}</strong>
                 </div>
-                <button onClick={() => openUrl(deviceCode.verificationUri)}>
+                <button onClick={() => openUrl(GITHUB_DEVICE_URL)}>
                   Ouvrir github.com/login/device
                 </button>
                 <button className="link-btn" onClick={cancelConnect}>

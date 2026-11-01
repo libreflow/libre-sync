@@ -373,7 +373,7 @@ fn gh_available() -> bool {
 /// when only an unauthenticated gh is installed). `Ok(None)` means
 /// "gh missing or not logged in": the UI shows the connect banner.
 #[tauri::command]
-pub fn gh_auth_status() -> Result<Option<String>, String> {
+pub async fn gh_auth_status() -> Result<Option<String>, String> {
     if !gh_available() {
         return Ok(None);
     }
@@ -389,133 +389,197 @@ pub fn gh_auth_status() -> Result<Option<String>, String> {
     }
 }
 
-
-/// OAuth Device Flow (https://docs.github.com/en/apps/creating-oauth-apps)
-/// -- designed for desktop apps: no redirect URL, no local server.
-/// Step 1: ask GitHub for a device+user code; the user opens the
-/// verification URI and types the code while we poll for the token.
-/// `client_id` is the public OAuth app id -- the secret is not used
-/// in this flow, safe to embed in a desktop app.
-#[tauri::command]
-pub fn github_device_code(client_id: String) -> Result<GithubDeviceCode, String> {
-    let resp = reqwest::blocking::Client::new()
-        .post("https://github.com/login/device/code")
-        .header("Accept", "application/json")
-        .form(&[("client_id", client_id.as_str())])
-        .send()
-        .map_err(|e| format!("Requete GitHub impossible: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("GitHub a refuse la demande: {}", resp.status()));
-    }
-    let json: GithubDeviceCode = resp
-        .json()
-        .map_err(|e| format!("Reponse GitHub invalide: {e}"))?;
-    Ok(json)
+/// In-flight "gh auth login --web": the spawned gh process, shared
+/// by the three IPC commands of the connect flow (begin / finish /
+/// cancel).
+struct GhConnect {
+    child: std::process::Child,
 }
 
-/// Step 2: poll GitHub for the token. Returns `Ok(None)` while the
-/// user hasn't confirmed yet (`authorization_pending`), `Ok(Some(token))`
-/// once they have. `Err` on hard errors (expired code, wrong client).
-#[tauri::command]
-pub fn github_device_poll(
-    client_id: String,
-    device_code: String,
-) -> Result<Option<String>, String> {
-    let resp = reqwest::blocking::Client::new()
-        .post("https://github.com/repos/login/oauth/access_token")
-        .header("Accept", "application/json")
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("device_code", device_code.as_str()),
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ])
-        .send()
-        .map_err(|e| format!("Requete GitHub impossible: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("GitHub a refuse la demande: {}", resp.status()));
-    }
-    let json: serde_json::Value = resp
-        .json()
-        .map_err(|e| format!("Reponse GitHub invalide: {e}"))?;
-    if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
-        return match err {
-            "authorization_pending" | "slow_down" => Ok(None),
-            "expired_token" => Err("Code expire -- relance la connexion.".to_string()),
-            "unsupported_grant_type" => Err("Flux non autorise pour cette OAuth App.".to_string()),
-            other => Err(format!("GitHub: {other}")),
-        };
-    }
-    Ok(json
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
+static GH_CONNECT: std::sync::Mutex<Option<GhConnect>> = std::sync::Mutex::new(None);
+
+/// The connection delegates entirely to "gh auth login --web": gh
+/// runs its own OAuth Device Flow with gh's own registered OAuth app,
+/// so no client id, no secret and no token ever exist in this
+/// codebase -- authentication state lives in gh's own storage, where
+/// every existing gh-based path (repo discovery, clones) reads it.
+const GH_CONNECT_CODE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Backstop only: gh's device code expires (~15 min) and gh exits by
+/// itself; past this the process is reaped just in case it didn't.
+const GH_CONNECT_LOGIN_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Drain a child pipe line by line into a channel, on its own thread:
+/// gh blocks the moment a pipe nobody reads fills up.
+fn drain_to_channel<R: std::io::Read + Send + 'static>(pipe: R, tx: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(pipe).lines() {
+            if tx.send(line.unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+    });
 }
 
-/// Step 3: hand the fresh token to `gh auth login` so every existing
-/// gh-based code path (repo discovery, clones) works unchanged and the
-/// token lives in gh's own secure storage, never in our config file.
-/// The token is passed via stdin, never as a command-line argument
-/// (visible in process lists) and never logged.
+/// The one-time code in gh's stderr line
+/// "First copy your one-time code: 1A2B-3C4D" -> Some("1A2B-3C4D").
+/// Kept separate from the process plumbing so it can be unit tested
+/// without a real gh run.
+fn extract_device_code(line: &str) -> Option<String> {
+    let pos = line.find("one-time code:")?;
+    line[pos + "one-time code:".len()..]
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Step 1: start "gh auth login --web" and return its one-time device
+/// code. gh prints "First copy your one-time code: 1A2B-3C4D" on
+/// stderr; once captured, a newline answers gh's "Press Enter" prompt
+/// (open github.com/login/device, start polling) and a second one
+/// pre-answers the later "Authenticate Git with your GitHub
+/// credentials?" prompt, whose default is Yes.
 #[tauri::command]
-pub fn gh_login_with_token() -> Result<(), String> {
-    use std::io::Write;
+pub async fn gh_connect_begin() -> Result<String, String> {
     if !gh_available() {
-        return Err("gh CLI introuvable -- installe GitHub CLI pour connecter ton compte.".to_string());
+        return Err(
+            "gh CLI introuvable -- installe GitHub CLI pour connecter ton compte.".to_string(),
+        );
     }
-    let mut child = std::process::Command::new("gh")
-        .args(["auth", "login", "--with-token"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    let mut guard = GH_CONNECT
+        .lock()
+        .map_err(|_| "Verrou interne.".to_string())?;
+    if guard.is_some() {
+        return Err("Une connexion GitHub est deja en cours.".to_string());
+    }
+
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "auth",
+        "login",
+        "--hostname",
+        "github.com",
+        "--git-protocol",
+        "https",
+        "--skip-ssh-key",
+        "--web",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Impossible de lancer gh: {e}"))?;
-    // Token is expected on stdin of the spawned gh process; the pipe
-    // write happens here, in-process, and is never stored anywhere.
-    let mut token = GITHUB_TOKEN.lock().map_err(|_| "Verrou interne.".to_string())?;
-    if token.is_empty() {
-        return Err("Aucun token a transmettre -- relance la connexion.".to_string());
+
+    // Scan gh's output for the code line; both pipes are drained so
+    // neither can fill up and hang gh before it prints the code.
+    let (tx, rx) = mpsc::channel::<String>();
+    if let Some(pipe) = child.stderr.take() {
+        drain_to_channel(pipe, tx.clone());
     }
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Impossible d'ecrire le token vers gh.".to_string())?;
-    stdin
-        .write_all(token.as_bytes())
-        .map_err(|e| format!("Transmission du token impossible: {e}"))?;
-    drop(stdin);
-    token.clear();
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("gh auth login a echoue: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    if let Some(pipe) = child.stdout.take() {
+        drain_to_channel(pipe, tx.clone());
     }
+    drop(tx);
+
+    let mut code: Option<String> = None;
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + GH_CONNECT_CODE_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // A disconnect means gh exited without printing any code.
+        let Ok(line) = rx.recv_timeout(remaining) else {
+            break;
+        };
+        seen.push_str(&line);
+        seen.push('\n');
+        if let Some(found) = extract_device_code(&line) {
+            code = Some(found);
+            break;
+        }
+    }
+
+    let Some(code) = code else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "gh n'a pas fourni de code a temps. Sortie de gh :\n{}",
+            seen.trim()
+        ));
+    };
+
+    // child.stdin is the only write handle: dropping it closes the
+    // pipe, but the two newlines buffered above stay readable by gh
+    // when it reaches each prompt.
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = writeln!(stdin);
+        let _ = writeln!(stdin);
+    }
+
+    *guard = Some(GhConnect { child });
+    Ok(code)
 }
 
-/// In-memory only: the token transits from the poll to gh's stdin and
-/// is never persisted to disk by this app.
-static GITHUB_TOKEN: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-
-/// Stores the token returned by `github_device_poll` in the in-memory
-/// slot `gh_login_with_token` reads from, then wipes the copy the
-/// frontend could have echoed into a log.
+/// Step 2: wait for the user to confirm on github.com/login/device and
+/// for gh to exit. The success criterion is "gh api user" answering
+/// with a login -- not gh's exit status, which stays non-zero when the
+/// process was killed mid-flow or when a post-login prompt hit the
+/// closed stdin after authentication already succeeded.
 #[tauri::command]
-pub fn github_store_token(token: String) {
-    if let Ok(mut slot) = GITHUB_TOKEN.lock() {
-        *slot = token;
+pub async fn gh_connect_finish() -> Result<String, String> {
+    let deadline = std::time::Instant::now() + GH_CONNECT_LOGIN_TIMEOUT;
+    loop {
+        let exited = {
+            let mut guard = GH_CONNECT
+                .lock()
+                .map_err(|_| "Verrou interne.".to_string())?;
+            match guard.as_mut() {
+                // None: another finish already reaped gh, or the user
+                // cancelled -- no connection is pending either way.
+                None => return Err("Connexion GitHub annulee.".to_string()),
+                Some(state) => state
+                    .child
+                    .try_wait()
+                    .map_err(|e| format!("Etat de gh illisible: {e}"))?,
+            }
+        };
+        if exited.is_some() {
+            gh_connect_cancel().await;
+            return match gh_auth_status().await? {
+                Some(login) => Ok(login),
+                None => Err(
+                    "Connexion GitHub echouee -- le code n'a pas ete confirme a temps ou a ete refuse."
+                        .to_string(),
+                ),
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            gh_connect_cancel().await;
+            return Err("Delai depasse -- relance la connexion.".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GithubDeviceCode {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub expires_in: u64,
-    pub interval: u64,
+/// Abort the in-flight connection: kill gh and forget the process.
+#[tauri::command]
+pub async fn gh_connect_cancel() {
+    if let Ok(mut guard) = GH_CONNECT.lock() {
+        if let Some(mut state) = guard.take() {
+            let _ = state.child.kill();
+            let _ = state.child.wait();
+        }
+    }
 }
 
 /// Default local path for a newly discovered repo: joins the base dir
@@ -1233,7 +1297,7 @@ pub async fn update_framework(app: AppHandle, name: String, owner: String) -> Re
 }
 
 #[tauri::command]
-pub fn open_in_explorer(path: String) -> Result<(), String> {
+pub async fn open_in_explorer(path: String) -> Result<(), String> {
     if !Path::new(&path).exists() {
         return Err(format!("Le chemin n'existe pas : {path}"));
     }
@@ -1350,6 +1414,23 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(default_repo_path("W:", "repo"), "W:/repo");
         assert_eq!(default_repo_path("~/hub/", "repo"), "~/hub/repo");
         assert_eq!(default_repo_path("~/hub", "repo"), "~/hub/repo");
+    }
+
+    #[test]
+    fn extract_device_code_parses_gh_line() {
+        assert_eq!(
+            extract_device_code("! First copy your one-time code: 1A2B-3C4D"),
+            Some("1A2B-3C4D".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_device_code_rejects_lines_without_a_code() {
+        assert_eq!(
+            extract_device_code("Press Enter to open https://github.com/login/device"),
+            None
+        );
+        assert_eq!(extract_device_code(""), None);
     }
 
     #[test]
